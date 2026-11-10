@@ -115,6 +115,26 @@ if [ "$(id -u)" -eq 0 ]; then
     # libpulse-mainloop-glib); libmalcontent-0-dev: correct trixie name.
     # libtracker-sparql-3.0-dev (transitional to libtinysparql-dev) pulls in the
     # full tracker/tinysparql dev stack for panels that need tracker-sparql-3.0.
+    if [ "$GNOME_CC_VER" -ge 50 ] 2>/dev/null; then
+    # GNOME 50+ (forky/sid): Build-Depends of gnome-control-center 1:51.1-2 in
+    # forky. Any missing package is fatal: one unknown name used to make apt
+    # skip the whole list and the failure was hidden by `|| true`.
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential meson ninja-build git gettext blueprint-compiler \
+        pkexec desktop-file-utils shared-mime-info gobject-introspection tecla \
+        libgtk-4-dev libadwaita-1-dev libgnome-desktop-4-dev libgnome-bg-4-dev \
+        libgnome-bluetooth-ui-3.0-dev libgnome-qr-gtk-4-dev libcolord-dev \
+        libcolord-gtk4-dev libgoa-1.0-dev libgoa-backend-1.0-dev libgtop2-dev \
+        libgudev-1.0-dev libupower-glib-dev libpwquality-dev libnm-dev \
+        libnma-gtk4-dev libsecret-1-dev libpolkit-gobject-1-dev \
+        libmalcontent-0-dev libaccountsservice-dev libglib2.0-dev \
+        libgdk-pixbuf-2.0-dev libgsound-dev libjson-glib-dev libsoup-3.0-dev \
+        libwacom-dev libibus-1.0-dev libkrb5-dev libgnutls28-dev libxml2-dev \
+        libxml2-utils libcups2-dev libgcr-4-dev libsmbclient-dev \
+        libudisks2-dev libpulse-dev libmm-glib-dev gnome-settings-daemon-dev \
+        gsettings-desktop-schemas-dev docbook-xsl xsltproc \
+        || { echo "❌ Build dependencies could not be installed" >&2; exit 1; }
+    else
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         build-essential \
         meson \
@@ -172,6 +192,7 @@ if [ "$(id -u)" -eq 0 ]; then
         libmm-glib-dev \
         udisks2 \
         2>/dev/null || true
+    fi
 fi
 
 # ==============================================================================
@@ -375,7 +396,7 @@ if ! $IS_DEBIAN_HOST && [ -n "$DEBIAN_CHROOT" ] && [ -d "$DEBIAN_CHROOT/usr/bin"
             --buildtype=release \
             -D documentation=false \
             -D location-services=enabled \
-            -D malcontent=true \
+            -D malcontent=\$(pkg-config --atleast-version=0.14 malcontent-0 && echo true || echo false) \
             -D distributor_logo=\"$DISTRIBUTOR_LOGO\" \
             -D dark_mode_distributor_logo=\"$DISTRIBUTOR_LOGO\" \
             build src
@@ -391,6 +412,11 @@ if ! $IS_DEBIAN_HOST && [ -n "$DEBIAN_CHROOT" ] && [ -d "$DEBIAN_CHROOT/usr/bin"
     cleanup_control_chroot
     trap - EXIT INT TERM
 else
+    # Debian's libmalcontent (forky: 0.13) is older than the >= 0.14 that GNOME
+    # 51 requires; without it meson tries the malcontent subproject (needs
+    # gi-docgen). Build without malcontent then (no parental-control sync).
+    MALCONTENT=true
+    pkg-config --atleast-version=0.14 malcontent-0 || MALCONTENT=false
     echo "🔨 [ES] Configurando con Meson local..."
     echo "🔨 [EN] Configuring with local Meson..."
     meson setup \
@@ -398,7 +424,7 @@ else
         --buildtype=release \
         -D documentation=false \
         -D location-services=enabled \
-        -D malcontent=true \
+        -D malcontent="$MALCONTENT" \
         -D distributor_logo="$DISTRIBUTOR_LOGO" \
         -D dark_mode_distributor_logo="$DISTRIBUTOR_LOGO" \
         "$BUILD_DIR" \
@@ -434,6 +460,10 @@ fi
 # Make Provides match the upstream version actually built (e.g. 1:51.1-1)
 if [ -f "$STAGE_DIR/DEBIAN/control" ]; then
     sed -i "s/^Provides: gnome-control-center.*/Provides: gnome-control-center (= 1:${FULL_TAG}-1)/" "$STAGE_DIR/DEBIAN/control"
+    # GNOME 51 links libgnome-qr (forky only; trixie has no such package)
+    if [ "$GNOME_CC_VER" -ge 50 ] 2>/dev/null; then
+        sed -i "s/^Depends: .*/&, libgnome-qr-gtk-4-0/" "$STAGE_DIR/DEBIAN/control"
+    fi
 fi
 
 # ==============================================================================
