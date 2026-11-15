@@ -298,6 +298,23 @@ mod tests {
     }
 
     #[test]
+    fn unresolvable_data_dir_disables_persistence_without_panicking() {
+        // Mirrors `data_dir()` returning `None` (platform lookup failed):
+        // history must stay in-memory only, and `save` must be a safe no-op
+        // instead of writing to a hardcoded fallback path.
+        let mgr = ClipboardManager::new_internal(SpotlightConfig::default(), None);
+        mgr.record_clip("in-memory-only");
+
+        let items: Vec<String> = mgr.get_items().into_iter().map(|i| i.text).collect();
+        assert_eq!(items, vec!["in-memory-only"]);
+        assert!(mgr.inner.lock().unwrap().data_dir.is_none());
+
+        // save() is called from record_clip already; call it again directly
+        // to confirm it doesn't panic when there's no data dir to write to.
+        mgr.save();
+    }
+
+    #[test]
     fn save_writes_file_with_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt;
 

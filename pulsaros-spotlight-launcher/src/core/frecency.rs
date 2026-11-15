@@ -63,7 +63,25 @@ impl Frecency {
 
     /// Marks `q` as most-recently-used and evicts the least-recently-used
     /// `learned` entries beyond `LEARNED_CAP`.
+    ///
+    /// `learned_recency` can be shorter than `learned` right after loading a
+    /// file persisted before this field existed (it deserializes to an empty
+    /// queue via `#[serde(default)]` while `learned` already holds legacy
+    /// keys). In that case every legacy key not yet in the queue is backfilled
+    /// first, so eviction below treats them as real LRU candidates instead of
+    /// leaving them permanently un-evictable while freshly-typed queries get
+    /// evicted immediately.
     fn touch_learned(&mut self, q: String) {
+        if self.learned_recency.len() < self.learned.len() {
+            let present: std::collections::HashSet<&String> = self.learned_recency.iter().collect();
+            let missing: Vec<String> = self
+                .learned
+                .keys()
+                .filter(|k| *k != &q && !present.contains(k))
+                .cloned()
+                .collect();
+            self.learned_recency.extend(missing);
+        }
         self.learned_recency.retain(|k| k != &q);
         self.learned_recency.push_back(q);
         while self.learned.len() > LEARNED_CAP {
@@ -198,6 +216,28 @@ mod tests {
         assert_eq!(f.learned.len(), LEARNED_CAP);
         assert!(f.learned.contains_key("q0"));
         assert!(!f.learned.contains_key("q1"));
+    }
+
+    #[test]
+    fn legacy_learned_without_recency_queue_does_not_evict_newly_typed_query() {
+        // Mirrors deserializing a frecency file persisted before
+        // `learned_recency` existed: `learned` is already at LEARNED_CAP
+        // from legacy data, but the LRU queue is empty (its
+        // `#[serde(default)]` value).
+        let mut f = Frecency::default();
+        for i in 0..LEARNED_CAP {
+            f.learned.insert(format!("legacy{}", i), BTreeMap::new());
+        }
+        assert_eq!(f.learned.len(), LEARNED_CAP);
+        assert!(f.learned_recency.is_empty());
+
+        // A brand-new query typed after upgrading must survive, not be
+        // evicted immediately as the only entry in the (otherwise empty)
+        // LRU queue.
+        f.record_launch("a", "new-query", 0);
+
+        assert!(f.learned.contains_key("new-query"));
+        assert_eq!(f.learned.len(), LEARNED_CAP);
     }
 
     #[test]
