@@ -1,12 +1,15 @@
 //! Frecency: +100 per launch, 10-day half-life. Learned terms: query -> id launch counts.
 //! Time is injected (`now` = unix seconds) so tests use a fake clock.
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use super::store::Store;
 
 pub const LAUNCH_BONUS: f64 = 100.0;
 pub const HALF_LIFE_SECS: f64 = 10.0 * 86400.0;
+/// Cap on distinct `learned` queries kept; least-recently-used ones are
+/// evicted beyond this so ranking-pass latency stays flat over time.
+pub const LEARNED_CAP: usize = 500;
 const FILE: &str = "frecency";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -22,6 +25,9 @@ pub struct Frecency {
     /// normalized query -> (id -> times chosen)
     #[serde(default)]
     pub learned: BTreeMap<String, BTreeMap<String, u32>>,
+    /// `learned` keys ordered oldest-to-most-recently-used, for LRU eviction.
+    #[serde(default)]
+    learned_recency: VecDeque<String>,
 }
 
 fn norm(q: &str) -> String {
@@ -50,7 +56,19 @@ impl Frecency {
         self.items.insert(id.to_string(), Entry { score: s, ts: now });
         let q = norm(query);
         if !q.is_empty() {
-            *self.learned.entry(q).or_default().entry(id.to_string()).or_insert(0) += 1;
+            *self.learned.entry(q.clone()).or_default().entry(id.to_string()).or_insert(0) += 1;
+            self.touch_learned(q);
+        }
+    }
+
+    /// Marks `q` as most-recently-used and evicts the least-recently-used
+    /// `learned` entries beyond `LEARNED_CAP`.
+    fn touch_learned(&mut self, q: String) {
+        self.learned_recency.retain(|k| k != &q);
+        self.learned_recency.push_back(q);
+        while self.learned.len() > LEARNED_CAP {
+            let Some(oldest) = self.learned_recency.pop_front() else { break };
+            self.learned.remove(&oldest);
         }
     }
 
@@ -151,6 +169,35 @@ mod tests {
         f.record_launch("old", "", -100 * DAY);
         assert_eq!(f.top(0, 50.0, 6), vec!["b", "a"]);
         assert_eq!(f.top(0, 50.0, 1), vec!["b"]);
+    }
+
+    #[test]
+    fn learned_map_evicts_least_recently_used_beyond_cap() {
+        let mut f = Frecency::default();
+        for i in 0..=LEARNED_CAP {
+            f.record_launch("a", &format!("q{}", i), 0);
+        }
+        assert_eq!(f.learned.len(), LEARNED_CAP);
+        // q0 was the least-recently-used query and should have been evicted.
+        assert!(!f.learned.contains_key("q0"));
+        // the most recently added query is retained.
+        assert!(f.learned.contains_key(&format!("q{}", LEARNED_CAP)));
+    }
+
+    #[test]
+    fn learned_map_cap_respects_recency_on_reuse() {
+        let mut f = Frecency::default();
+        for i in 0..LEARNED_CAP {
+            f.record_launch("a", &format!("q{}", i), 0);
+        }
+        // Re-recording q0 bumps it to most-recently-used.
+        f.record_launch("a", "q0", 0);
+        // Adding one more distinct query now evicts q1, not q0.
+        f.record_launch("a", "new-query", 0);
+
+        assert_eq!(f.learned.len(), LEARNED_CAP);
+        assert!(f.learned.contains_key("q0"));
+        assert!(!f.learned.contains_key("q1"));
     }
 
     #[test]
