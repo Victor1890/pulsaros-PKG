@@ -32,3 +32,31 @@ fn thumb_detects_extensions() {
     assert!(is_video_file("file:///tmp/a.Mp4"));
     assert!(!is_image_file("file:///tmp/a.txt"));
 }
+
+#[test]
+fn helper_past_timeout_is_killed() {
+    let start = std::time::Instant::now();
+    let mut cmd = Command::new("sleep");
+    cmd.arg("30");
+    assert!(!run_with_timeout(cmd, Duration::from_millis(200)));
+    assert!(start.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn fast_helper_succeeds() {
+    let cmd = Command::new("true");
+    assert!(run_with_timeout(cmd, Duration::from_secs(5)));
+}
+
+#[test]
+fn scratch_dir_is_private_and_cleaned_up() {
+    use std::os::unix::fs::PermissionsExt;
+    let kept;
+    {
+        let s = ScratchDir::new().expect("scratch dir");
+        kept = s.path().to_path_buf();
+        assert_eq!(std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(!kept.starts_with("/tmp"));
+    }
+    assert!(!kept.exists());
+}
