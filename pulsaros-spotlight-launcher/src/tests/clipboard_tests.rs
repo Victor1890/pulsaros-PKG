@@ -64,6 +64,7 @@ fn save_writes_file_with_owner_only_permissions() {
 
     let mgr = manager_with_max(50);
     mgr.record_clip("secret-token");
+    mgr.flush();
 
     let dir = mgr.inner.lock().unwrap().data_dir.clone().unwrap();
     let file = ClipboardManager::clipboard_file_in(&dir);
@@ -84,6 +85,7 @@ fn save_creates_private_dir_and_tightens_existing_loose_file() {
 
     let mgr = ClipboardManager::new_for_test(SpotlightConfig::default(), dir.clone());
     mgr.record_clip("x");
+    mgr.flush();
 
     assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
     assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
@@ -106,4 +108,41 @@ fn password_manager_hint_is_not_recorded() {
     assert!(mgr.get_items().is_empty());
     mgr.record_clip_with_formats("ordinary", &["text/plain"]);
     assert_eq!(mgr.get_items().len(), 1);
+}
+
+#[test]
+fn burst_of_clips_is_written_once_and_flush_persists_the_latest() {
+    let dir = temp_dir("burst");
+    let mgr = ClipboardManager::new_for_test(SpotlightConfig::default(), dir.clone());
+    for i in 0..20 {
+        mgr.record_clip(&format!("clip {i}"));
+    }
+    mgr.flush();
+    let reloaded = ClipboardManager::new_for_test(SpotlightConfig::default(), dir);
+    let items: Vec<String> = reloaded.get_items().into_iter().map(|i| i.text).collect();
+    assert_eq!(items.first().map(String::as_str), Some("clip 19"));
+    assert_eq!(items.len(), 20);
+}
+
+#[test]
+fn record_clip_does_not_wait_for_disk() {
+    let mgr = manager_with_max(50);
+    let start = std::time::Instant::now();
+    for i in 0..200 {
+        mgr.record_clip(&format!("clip {i}"));
+    }
+    // 200 synchronous pretty-printed writes would take far longer than this.
+    assert!(start.elapsed() < std::time::Duration::from_millis(500));
+}
+
+#[test]
+fn search_is_case_insensitive_via_cached_lowercase() {
+    let mgr = manager_with_max(50);
+    mgr.record_clip("Hello World");
+    mgr.record_clip("other");
+    let hits = mgr.search_history("HELLO");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].title, "Hello World");
+    mgr.record_clip("Hello World"); // dedup move-to-top keeps cache aligned
+    assert_eq!(mgr.search_history("hello").len(), 1);
 }

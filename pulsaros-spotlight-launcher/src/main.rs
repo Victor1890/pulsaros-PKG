@@ -101,6 +101,10 @@ fn main() -> gtk4::glib::ExitCode {
 
             let config = SpotlightConfig::load();
             let clipboard_mgr = ClipboardManager::new(config.clone());
+            // History is written by a background thread after a short quiet period; make sure the
+            // latest copies reach disk when the app quits.
+            let flush_mgr = clipboard_mgr.clone();
+            app.connect_shutdown(move |_| flush_mgr.flush());
             let backend = SearchBackend::new(Some(clipboard_mgr.clone()));
 
             // Clipboard change listener

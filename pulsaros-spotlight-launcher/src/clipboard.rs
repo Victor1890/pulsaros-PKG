@@ -22,10 +22,25 @@ pub struct ClipboardItem {
 #[derive(Clone)]
 pub struct ClipboardManager {
     inner: Arc<Mutex<ClipboardManagerInner>>,
+    /// Background writer; `None` when history is in-memory only.
+    writer: Option<std::sync::mpsc::Sender<WriterMsg>>,
 }
+
+/// Messages for the background history writer.
+enum WriterMsg {
+    /// Latest snapshot to persist; bursts are coalesced into one write.
+    Save(Vec<ClipboardItem>),
+    /// Write any pending snapshot now, then signal.
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+/// Quiet period after the last change before a snapshot is written.
+const SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 
 struct ClipboardManagerInner {
     items: Vec<ClipboardItem>,
+    /// Lowercased copy of each item's text (same order), so search doesn't re-lowercase per keystroke.
+    lower: Vec<String>,
     config: SpotlightConfig,
     /// Resolved data directory for this session; `None` means the platform
     /// data-directory lookup failed, so history stays in-memory only.
@@ -72,18 +87,81 @@ impl ClipboardManager {
             }
         }
 
-        let inner = Arc::new(Mutex::new(ClipboardManagerInner { items, config, data_dir: dir }));
-        Self { inner }
+        let lower = items.iter().map(|i| i.text.to_lowercase()).collect();
+        let writer = dir.clone().map(Self::spawn_writer);
+        let inner = Arc::new(Mutex::new(ClipboardManagerInner { items, lower, config, data_dir: dir }));
+        Self { inner, writer }
     }
 
+    /// Starts the writer thread. It waits for a quiet period after the last snapshot so a burst
+    /// of copies costs one write, and exits when every manager clone is dropped.
+    fn spawn_writer(dir: PathBuf) -> std::sync::mpsc::Sender<WriterMsg> {
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        let (tx, rx) = channel::<WriterMsg>();
+        std::thread::spawn(move || {
+            let write = |items: &Vec<ClipboardItem>| Self::persist(&dir, items);
+            let mut pending: Option<Vec<ClipboardItem>> = None;
+            loop {
+                let msg = if pending.is_some() {
+                    match rx.recv_timeout(SAVE_DEBOUNCE) {
+                        Ok(m) => Some(m),
+                        Err(RecvTimeoutError::Timeout) => None,
+                        Err(RecvTimeoutError::Disconnected) => {
+                            if let Some(items) = pending.take() {
+                                write(&items);
+                            }
+                            return;
+                        }
+                    }
+                } else {
+                    match rx.recv() {
+                        Ok(m) => Some(m),
+                        Err(_) => return,
+                    }
+                };
+                match msg {
+                    Some(WriterMsg::Save(items)) => pending = Some(items),
+                    Some(WriterMsg::Flush(ack)) => {
+                        if let Some(items) = pending.take() {
+                            write(&items);
+                        }
+                        let _ = ack.send(());
+                    }
+                    None => {
+                        if let Some(items) = pending.take() {
+                            write(&items);
+                        }
+                    }
+                }
+            }
+        });
+        tx
+    }
+
+    /// Writes any pending history to disk now. Call before the process exits.
+    pub fn flush(&self) {
+        if let Some(tx) = &self.writer {
+            let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+            if tx.send(WriterMsg::Flush(ack_tx)).is_ok() {
+                let _ = ack_rx.recv_timeout(std::time::Duration::from_secs(5));
+            }
+        }
+    }
+
+    /// Persists the current history synchronously. Used by tests and shutdown; normal
+    /// changes go through the background writer instead.
     pub fn save(&self) {
         let inner = self.inner.lock().unwrap();
         let Some(dir) = inner.data_dir.clone() else { return };
-        if Self::ensure_private_dir(&dir).is_err() {
+        Self::persist(&dir, &inner.items);
+    }
+
+    fn persist(dir: &std::path::Path, items: &Vec<ClipboardItem>) {
+        if Self::ensure_private_dir(dir).is_err() {
             return;
         }
-        let file = Self::clipboard_file_in(&dir);
-        if let Ok(content) = serde_json::to_string_pretty(&inner.items) {
+        let file = Self::clipboard_file_in(&dir.to_path_buf());
+        if let Ok(content) = serde_json::to_string_pretty(items) {
             let _ = Self::write_private(&file, content.as_bytes());
         }
     }
@@ -146,13 +224,18 @@ impl ClipboardManager {
         }
 
         // Remove previous occurrences
-        inner.items.retain(|item| item.text != clean);
+        let keep: Vec<bool> = inner.items.iter().map(|item| item.text != clean).collect();
+        let mut k = keep.iter();
+        inner.items.retain(|_| *k.next().unwrap());
+        let mut k = keep.iter();
+        inner.lower.retain(|_| *k.next().unwrap());
 
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
 
+        inner.lower.insert(0, clean.to_lowercase());
         inner.items.insert(0, ClipboardItem {
             text: clean.to_string(),
             timestamp,
@@ -162,11 +245,15 @@ impl ClipboardManager {
         let max_items = inner.config.clipboard_max_items;
         if inner.items.len() > max_items {
             inner.items.truncate(max_items);
+            inner.lower.truncate(max_items);
         }
 
-        // Save immediately
+        // Hand a snapshot to the background writer; never block the caller on disk I/O.
+        let snapshot = inner.items.clone();
         drop(inner);
-        self.save();
+        if let Some(tx) = &self.writer {
+            let _ = tx.send(WriterMsg::Save(snapshot));
+        }
     }
 
     pub fn get_items(&self) -> Vec<ClipboardItem> {
@@ -179,12 +266,13 @@ impl ClipboardManager {
     }
 
     pub fn search_history(&self, query: &str) -> Vec<SearchResult> {
-        let items = self.get_items();
+        let inner = self.inner.lock().unwrap();
+        let items = &inner.items;
         let q_lower = query.trim().to_lowercase();
         let mut results = Vec::new();
 
         for (idx, item) in items.iter().enumerate() {
-            if q_lower.is_empty() || item.text.to_lowercase().contains(&q_lower) {
+            if q_lower.is_empty() || inner.lower[idx].contains(&q_lower) {
                 let lines: Vec<&str> = item.text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
                 let mut first_line = lines.first().copied().unwrap_or(&item.text).to_string();
                 if first_line.chars().count() > 60 {
