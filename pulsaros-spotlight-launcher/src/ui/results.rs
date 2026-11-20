@@ -175,6 +175,26 @@ fn has_thumbnail_support(url: &str) -> bool {
 /// How long a thumbnail helper (`pdftoppm`, `ffmpeg`) may run before it is killed.
 const THUMB_HELPER_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Picks the directory that holds scratch roots: `$XDG_RUNTIME_DIR` when it is an existing
+/// absolute directory, else the per-user cache dir. Never falls back to `/tmp`; with neither
+/// available it returns `None` and the caller skips the thumbnail.
+fn scratch_base(
+    runtime_dir: Option<std::path::PathBuf>,
+    cache_home: Option<std::path::PathBuf>,
+    cache_dir: Option<std::path::PathBuf>,
+    home: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    runtime_dir
+        .filter(|p| p.is_absolute() && p.is_dir())
+        .or_else(|| {
+            cache_home
+                .filter(|p| p.is_absolute())
+                .or(cache_dir)
+                .or_else(|| home.map(|h| h.join(".cache")))
+                .map(|c| c.join("pulsaros-spotlight"))
+        })
+}
+
 /// A private, exclusively created scratch directory for one thumbnail job. It lives under
 /// `$XDG_RUNTIME_DIR` (or the cache dir), never in world-writable `/tmp`, so another local
 /// user can't pre-create the output path as a symlink. Removed on drop.
@@ -183,10 +203,12 @@ struct ScratchDir(std::path::PathBuf);
 impl ScratchDir {
     fn new() -> Option<Self> {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-        let base = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(std::path::PathBuf::from)
-            .filter(|p| p.is_dir())
-            .unwrap_or_else(|| thumb_cache_dir().parent().map(|p| p.to_path_buf()).unwrap_or_else(|| thumb_cache_dir()));
+        let base = scratch_base(
+            std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from),
+            std::env::var_os("XDG_CACHE_HOME").map(std::path::PathBuf::from),
+            dirs::cache_dir(),
+            dirs::home_dir(),
+        )?;
         let root = base.join("pulsaros-spotlight-scratch");
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&root).ok()?;
         let meta = std::fs::symlink_metadata(&root).ok()?;
