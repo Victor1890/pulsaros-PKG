@@ -56,7 +56,16 @@ fn scratch_dir_is_private_and_cleaned_up() {
         let s = ScratchDir::new().expect("scratch dir");
         kept = s.path().to_path_buf();
         assert_eq!(std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777, 0o700);
-        assert!(!kept.starts_with("/tmp"));
+        // Lives under the base the code chose (runtime dir, else cache dir). That base is the
+        // user's own directory; it may sit under /tmp in a build chroot, so don't assert on /tmp.
+        let base = scratch_base(
+            std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from),
+            std::env::var_os("XDG_CACHE_HOME").map(std::path::PathBuf::from),
+            dirs::cache_dir(),
+            dirs::home_dir(),
+        )
+        .expect("scratch base");
+        assert!(kept.starts_with(&base), "{kept:?} not under {base:?}");
     }
     assert!(!kept.exists());
 }
