@@ -107,3 +107,18 @@ fn password_manager_hint_is_not_recorded() {
     mgr.record_clip_with_formats("ordinary", &["text/plain"]);
     assert_eq!(mgr.get_items().len(), 1);
 }
+
+#[test]
+fn history_is_saved_as_compact_json_and_reloads() {
+    let dir = temp_dir("compact");
+    let mgr = ClipboardManager::new_for_test(SpotlightConfig::default(), dir.clone());
+    mgr.record_clip("one");
+    mgr.record_clip("two");
+
+    let raw = fs::read_to_string(ClipboardManager::clipboard_file_in(&dir)).unwrap();
+    assert!(!raw.contains('\n'), "history should not be pretty-printed: {raw}");
+
+    let reloaded = ClipboardManager::new_for_test(SpotlightConfig::default(), dir);
+    let items: Vec<String> = reloaded.get_items().into_iter().map(|i| i.text).collect();
+    assert_eq!(items, vec!["two", "one"]);
+}

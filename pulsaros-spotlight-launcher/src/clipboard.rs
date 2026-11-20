@@ -83,7 +83,7 @@ impl ClipboardManager {
             return;
         }
         let file = Self::clipboard_file_in(&dir);
-        if let Ok(content) = serde_json::to_string_pretty(&inner.items) {
+        if let Ok(content) = serde_json::to_string(&inner.items) {
             let _ = Self::write_private(&file, content.as_bytes());
         }
     }
