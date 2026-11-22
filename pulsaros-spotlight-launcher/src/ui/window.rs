@@ -5,6 +5,7 @@ use crate::clipboard::ClipboardManager;
 use crate::config::SpotlightConfig;
 use crate::core::commands::{self, Command};
 use crate::core::frecency::Frecency;
+use crate::core::nav::{Browse, Nav, NavEvent, Opened};
 use crate::core::layout::{self, Action as LayoutAction, BarMode, Context as LayoutCtx, Event as LayoutEvent, LayoutState};
 use crate::core::root_search::{AppEntry, Ctx, Row, RowKind, RootSearch, SearchIndex};
 use crate::core::settings::Settings;
@@ -22,22 +23,16 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
+mod chrome;
+mod dialog;
 mod extras;
+mod panel;
+mod toast;
+use chrome::*;
+use dialog::Dialog;
 use extras::{Extras, View};
-
-const DEBOUNCE_MS: u64 = 80;
-const BASE_W: i32 = 712;
-const BASE_H: i32 = 580;
-/// Idle pill size (before zoom).
-const PILL_W: i32 = 740;
-const PILL_H: i32 = 60;
-/// Mode button diameter and the gap between bar items (before zoom).
-const MODE_BTN: f64 = 60.0;
-const MODE_GAP: f64 = 12.0;
-/// Bar buttons: (shortcut number, tooltip). Order matches `shortcuts::mode_id`.
-const BAR_BUTTONS: [(usize, &str); 4] = [(1, "Applications"), (2, "Files"), (3, "Actions"), (4, "Clipboard")];
-const ZOOM_MIN: f64 = 0.8;
-const ZOOM_MAX: f64 = 1.6;
+pub(crate) use panel::primary_title;
+use panel::Panel;
 
 type SectionList = Vec<(String, Vec<RowData>)>;
 
@@ -51,24 +46,6 @@ struct UiAction {
     argv: Option<Vec<String>>,
 }
 
-struct Panel {
-    root: gtk4::Box,
-    list: gtk4::ListBox,
-    entry: gtk4::Entry,
-    all: RefCell<Vec<UiAction>>,
-    shown: RefCell<Vec<UiAction>>,
-    target: RefCell<Option<RowData>>,
-}
-
-struct Dialog {
-    root: gtk4::Box,
-    title: gtk4::Label,
-    body: gtk4::Label,
-    entry: gtk4::Entry,
-    ok: gtk4::Button,
-    on_ok: RefCell<Option<Box<dyn Fn(String)>>>,
-}
-
 pub struct SpotlightWindow {
     window: gtk4::ApplicationWindow,
     search_entry: gtk4::Entry,
@@ -77,11 +54,10 @@ pub struct SpotlightWindow {
     config: Rc<RefCell<SpotlightConfig>>,
     backend: SearchBackend,
     category: Cell<Category>,
-    current_dir: Rc<RefCell<Option<String>>>,
+    /// Which list is shown, how the Panel opened, whether the query was typed.
+    nav: RefCell<Nav>,
     debounce_id: Rc<RefCell<Option<glib::SourceId>>>,
     search_seq: Rc<Cell<u64>>,
-    history_mode: Cell<bool>,
-    calc_hist_mode: Cell<bool>,
     calc_history: RefCell<CalcHistory>,
     last_currency: Cell<Option<std::time::Instant>>,
 
@@ -124,12 +100,6 @@ pub struct SpotlightWindow {
     hypr_poll: RefCell<Option<glib::SourceId>>,
     /// The buttons were shown at some point since the window opened.
     revealed: Cell<bool>,
-    /// The query text came from the user's typing (not from a mode or a view).
-    query_typed: Cell<bool>,
-    /// The Panel was opened by Down (home view).
-    home_opened: Cell<bool>,
-    /// The Panel was opened by Up (history).
-    history_opened: Cell<bool>,
     /// First pointer position seen since the window opened.
     pointer_origin: Cell<Option<(f64, f64)>>,
     /// Everything below the header row; hidden while the layout is Idle.
@@ -138,85 +108,6 @@ pub struct SpotlightWindow {
     progress_revealer: gtk4::Revealer,
     progress_spinner: gtk4::Spinner,
     progress_label: gtk4::Label,
-}
-
-fn pulsar_liquid_glass_enabled() -> bool {
-    let Some(src) = gtk4::gio::SettingsSchemaSource::default() else { return true };
-    if src.lookup("org.gnome.shell", true).is_none() {
-        return true;
-    }
-    let settings = gtk4::gio::Settings::new("org.gnome.shell");
-    let exts = settings.strv("enabled-extensions");
-    exts.iter().any(|uuid| {
-        let u = uuid.as_str();
-        u == "liquid-glass@thinkingcoding1231.gmail.com"
-            || u == "blur-my-shell@aunetx"
-            || u.contains("blur")
-            || u.contains("glass")
-    }) || true
-}
-
-/// Load `data/icons/<name>` from the install dirs, falling back to the source tree.
-fn icon_file(name: &str) -> Option<PathBuf> {
-    [get_local_icon_dir(), get_icon_dir(), PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/data/icons"))]
-        .into_iter()
-        .map(|d| d.join(name))
-        .find(|f| f.exists())
-}
-
-fn set_mode_icon(img: &gtk4::Image, glyph: &str) {
-    match icon_file(&format!("mode-{glyph}-symbolic.svg")) {
-        Some(f) => img.set_from_gicon(&gtk4::gio::FileIcon::new(&gtk4::gio::File::for_path(f))),
-        None => img.set_icon_name(Some(if glyph == "more" { "view-more-symbolic" } else { "system-search-symbolic" })),
-    }
-}
-
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-fn keycap(text: &str) -> gtk4::Label {
-    let l = gtk4::Label::new(Some(text));
-    l.add_css_class("keycap");
-    l
-}
-
-fn keycap_row(keys: &[String]) -> gtk4::Box {
-    let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-    for k in keys {
-        b.append(&keycap(k));
-    }
-    b
-}
-
-/// Title of the primary action for the panel and the selected-row hint.
-pub(crate) fn primary_title(r: &RowData) -> String {
-    for (prefix, title) in [("dmenu:", "Select"), ("snippet:", "Paste Snippet"), ("window:", "Switch to Window"), ("script:", "Run Script")] {
-        if r.row.id.starts_with(prefix) {
-            return title.into();
-        }
-    }
-    match r.row.kind {
-        RowKind::App => "Open Application".into(),
-        RowKind::Command => "Run".into(),
-        RowKind::Clipboard => "Paste".into(),
-        RowKind::Calc => "Copy Answer".into(),
-        RowKind::File => match &r.payload {
-            Some(p) if p.mime == "inode/directory" || p.mime == "folder" => "Open Folder".into(),
-            Some(p) if p.url.starts_with("http") => "Open in Browser".into(),
-            _ => "Open".into(),
-        },
-        RowKind::Fallback => {
-            if r.row.id.starts_with("history:") {
-                "Search Again".into()
-            } else {
-                r.row.actions.first().map(|a| a.title.clone()).unwrap_or_else(|| "Open".into())
-            }
-        }
-    }
 }
 
 fn calc_row(c: &CalcResult, id: String) -> RowData {
@@ -245,41 +136,6 @@ fn clean_uninstall_message(message: &str, app_name: &str) -> String {
         clean = err_part.trim().to_string();
     }
     clean
-}
-
-fn zoom_css(z: f64) -> String {
-    let p = |v: f64| (v * z).round();
-    format!(
-        "window.spotlight-window .spotlight-main {{ font-size: {}px; }}
-         window.spotlight-window entry.search-input, window.spotlight-window entry.search-input > text {{ font-size: {}px; }}
-         window.spotlight-window .result-row {{ min-height: {}px; }}
-         window.spotlight-window .result-title {{ font-size: {}px; }}
-         window.spotlight-window .result-subtitle, window.spotlight-window .result-kind {{ font-size: {}px; }}
-         window.spotlight-window .section-header {{ font-size: {}px; }}
-         window.spotlight-window .icon-tile {{ min-width: {}px; min-height: {}px; }}
-         window.spotlight-window .result-icon {{ -gtk-icon-size: {}px; }}
-         window.spotlight-window .search-header {{ min-height: {}px; }}
-         window.spotlight-window.idle .search-header {{ min-height: {}px; }}
-         window.spotlight-window.idle entry.search-input, window.spotlight-window.idle entry.search-input > text {{ font-size: {}px; }}
-         window.spotlight-window button.mode-button {{ min-width: {}px; min-height: {}px; -gtk-icon-size: {}px; }}
-         window.spotlight-window .mode-buttons {{ margin-left: {}px; }}",
-        p(13.0),
-        p(30.0),
-        p(56.0),
-        p(17.0),
-        p(13.0),
-        p(12.0),
-        p(44.0),
-        p(44.0),
-        p(40.0),
-        p(76.0),
-        p(PILL_H as f64),
-        p(24.0),
-        p(MODE_BTN),
-        p(MODE_BTN),
-        p(26.0),
-        p(MODE_GAP)
-    )
 }
 
 impl SpotlightWindow {
@@ -586,11 +442,9 @@ impl SpotlightWindow {
             config: config_rc,
             backend,
             category: Cell::new(Category::All),
-            current_dir: Rc::new(RefCell::new(None)),
+            nav: RefCell::new(Nav::default()),
             debounce_id: Rc::new(RefCell::new(None)),
             search_seq: Rc::new(Cell::new(0)),
-            history_mode: Cell::new(false),
-            calc_hist_mode: Cell::new(false),
             calc_history: RefCell::new(CalcHistory::open()),
             last_currency: Cell::new(None),
             store,
@@ -637,9 +491,6 @@ impl SpotlightWindow {
             global_pointer: Cell::new(false),
             hypr_poll: RefCell::new(None),
             revealed: Cell::new(false),
-            query_typed: Cell::new(false),
-            home_opened: Cell::new(false),
-            history_opened: Cell::new(false),
             pointer_origin: Cell::new(None),
             panel_parts,
             progress_revealer,
@@ -776,13 +627,23 @@ impl SpotlightWindow {
         self.refresh_extras();
     }
 
+    fn nav_apply(&self, e: NavEvent) {
+        self.nav.borrow_mut().apply(e);
+    }
+
+    fn in_recent(&self) -> bool {
+        self.nav.borrow().browse == Browse::RecentSearches
+    }
+
+    fn in_calc_history(&self) -> bool {
+        self.nav.borrow().browse == Browse::CalcHistory
+    }
+
     fn reset_to_root(self: &Rc<Self>) {
         self.close_panel();
         self.close_dialog();
         self.leave_view();
-        *self.current_dir.borrow_mut() = None;
-        self.history_mode.set(false);
-        self.calc_hist_mode.set(false);
+        self.nav_apply(NavEvent::ToRoot);
         self.category.set(Category::All);
         self.apply_layout(if self.revealed.get() { LayoutState::IdleModes } else { LayoutState::Idle });
         self.set_mode(Category::All);
@@ -798,9 +659,7 @@ impl SpotlightWindow {
             self.revealed.set(true);
         }
         if idle {
-            self.home_opened.set(false);
-            self.history_opened.set(false);
-            self.query_typed.set(false);
+            self.nav_apply(NavEvent::Collapsed);
         }
         for w in &self.panel_parts {
             w.set_visible(!idle);
@@ -841,57 +700,6 @@ impl SpotlightWindow {
         anim.set_easing(adw::Easing::EaseOutCubic);
         anim.play();
         *self.size_anim.borrow_mut() = Some(anim);
-    }
-
-    // ---- loading bar / toast -------------------------------------------------
-
-    fn loading_begin(self: &Rc<Self>) {
-        let n = self.loading_count.get() + 1;
-        self.loading_count.set(n);
-        if n == 1 {
-            self.loading_bar.set_opacity(1.0);
-            let bar = self.loading_bar.clone();
-            let id = glib::timeout_add_local(Duration::from_millis(50), move || {
-                bar.pulse();
-                glib::ControlFlow::Continue
-            });
-            *self.loading_timer.borrow_mut() = Some(id);
-        }
-    }
-
-    fn loading_end(&self) {
-        let n = self.loading_count.get().saturating_sub(1);
-        self.loading_count.set(n);
-        if n == 0 {
-            if let Some(id) = self.loading_timer.borrow_mut().take() {
-                id.remove();
-            }
-            self.loading_bar.set_opacity(0.0);
-            self.loading_bar.set_fraction(0.0);
-        }
-    }
-
-    fn toast(self: &Rc<Self>, msg: &str, undo: Option<Rc<dyn Fn()>>) {
-        self.footer_status.set_label(msg);
-        self.toast_pill.set_visible(true);
-        self.toast_undo.set_visible(undo.is_some());
-        *self.toast_cb.borrow_mut() = undo;
-        if let Some(id) = self.toast_timer.borrow_mut().take() {
-            id.remove();
-        }
-        let s = self.clone();
-        let id = glib::timeout_add_local(Duration::from_millis(4000), move || {
-            *s.toast_timer.borrow_mut() = None;
-            s.reset_toast();
-            glib::ControlFlow::Break
-        });
-        *self.toast_timer.borrow_mut() = Some(id);
-    }
-
-    fn reset_toast(&self) {
-        self.toast_pill.set_visible(false);
-        self.toast_undo.set_visible(false);
-        *self.toast_cb.borrow_mut() = None;
     }
 
     // ---- state persistence ---------------------------------------------------
@@ -1038,13 +846,13 @@ impl SpotlightWindow {
     }
 
     fn on_search_changed(self: &Rc<Self>) {
-        self.history_mode.set(false);
+        self.nav_apply(NavEvent::QueryChanged);
         let empty = self.search_entry.text().is_empty();
         if self.layout.get() != LayoutState::Panel && !empty {
             self.apply_layout(LayoutState::Panel);
         }
         if empty {
-            let typed = self.query_typed.replace(false);
+            let typed = std::mem::replace(&mut self.nav.borrow_mut().typed, false);
             let ctx = LayoutCtx { query_typed: typed, ..self.panel_ctx() };
             let o = layout::transition(self.layout.get(), &ctx, LayoutEvent::QueryEmptied);
             if o.action == LayoutAction::Collapse {
@@ -1052,7 +860,7 @@ impl SpotlightWindow {
                 return;
             }
         } else {
-            self.query_typed.set(true);
+            self.nav_apply(NavEvent::Typed(true));
         }
         if let Some(id) = self.debounce_id.borrow_mut().take() {
             id.remove();
@@ -1140,15 +948,15 @@ impl SpotlightWindow {
         }
 
         // If in media/document category and query empty and not browsing, start browsing the category dir
-        if query.trim().is_empty() && self.current_dir.borrow().is_none() {
+        if query.trim().is_empty() && self.nav.borrow().is_root() {
             if let Some(d) = category.browse_dir() {
                 if d.is_dir() {
-                    *self.current_dir.borrow_mut() = Some(d.display().to_string());
+                    self.nav_apply(NavEvent::OpenDir(d.display().to_string()));
                 }
             }
         }
 
-        let browsing_dir = self.current_dir.borrow().clone();
+        let browsing_dir = self.nav.borrow().dir().map(str::to_string);
         if let Some(dir_path) = browsing_dir.as_ref() {
             let rows = browse_directory_plain(dir_path, query.trim());
             *self.current.borrow_mut() = vec![("Files".to_string(), rows)];
@@ -1157,7 +965,7 @@ impl SpotlightWindow {
         }
 
         let is_empty = query.trim().is_empty();
-        if self.calc_hist_mode.get() {
+        if self.in_calc_history() {
             let rows: Vec<RowData> = self
                 .calc_history
                 .borrow()
@@ -1302,15 +1110,14 @@ impl SpotlightWindow {
         if rows.is_empty() {
             return;
         }
-        self.history_mode.set(true);
+        self.nav_apply(NavEvent::ShowRecent);
         *self.current.borrow_mut() = vec![("Recent searches".to_string(), rows)];
         self.render(false);
     }
 
     fn enter_calc_history(self: &Rc<Self>) {
         self.close_panel();
-        self.calc_hist_mode.set(true);
-        self.history_mode.set(false);
+        self.nav_apply(NavEvent::ShowCalcHistory);
         self.search_entry.set_placeholder_text(Some("Search calculator history\u{2026}"));
         self.search_entry.set_text("");
         self.do_search(false);
@@ -1327,7 +1134,7 @@ impl SpotlightWindow {
 
     /// Switch mode: updates category, glyph and placeholder (no search).
     fn set_mode(&self, cat: Category) {
-        self.query_typed.set(false);
+        self.nav_apply(NavEvent::Typed(false));
         self.category.set(cat);
         set_mode_icon(&self.mode_icon, cat.glyph());
         self.search_entry.set_placeholder_text(Some(cat.placeholder()));
@@ -1354,9 +1161,7 @@ impl SpotlightWindow {
     fn goto_mode(self: &Rc<Self>, cat: Category) {
         self.leave_view();
         self.set_mode(cat);
-        *self.current_dir.borrow_mut() = None;
-        self.history_mode.set(false);
-        self.calc_hist_mode.set(false);
+        self.nav_apply(NavEvent::ToRoot);
         match cat {
             Category::Windows => {
                 self.push_view(View::Windows, "Filter open windows\u{2026}");
@@ -1441,7 +1246,7 @@ impl SpotlightWindow {
     }
 
     fn run_action_index(self: &Rc<Self>, n: usize) {
-        if self.history_mode.get() {
+        if self.in_recent() {
             if let Some(rd) = self.result_view.selected_row() {
                 self.perform(rd, "open", None);
             }
@@ -1465,7 +1270,7 @@ impl SpotlightWindow {
         match action {
             "calc_copy" | "calc_paste" | "calc_full" => {
                 let Some(c) = rd.calc.clone() else { return };
-                if !self.calc_hist_mode.get() {
+                if !self.in_calc_history() {
                     self.calc_history.borrow_mut().add(&c);
                 }
                 match action {
@@ -1508,7 +1313,7 @@ impl SpotlightWindow {
             }
             "open" | "run" | "open_url" => {
                 if let Some(q) = id.strip_prefix("history:") {
-                    self.history_mode.set(false);
+                    self.nav_apply(NavEvent::QueryChanged);
                     self.search_entry.set_text(q);
                     self.search_entry.set_position(-1);
                     return;
@@ -1705,7 +1510,7 @@ impl SpotlightWindow {
         }
         let clean_path = res.url.trim_start_matches("file://");
         if Path::new(clean_path).is_dir() && (res.mime == "inode/directory" || res.mime == "folder") {
-            *self.current_dir.borrow_mut() = Some(clean_path.to_string());
+            self.nav_apply(NavEvent::OpenDir(clean_path.to_string()));
             self.search_entry.set_text("");
             self.search_entry.set_placeholder_text(Some(&format!("Browsing: {}", clean_path)));
             // set_text only emits 'changed' when the text differs
@@ -1762,252 +1567,6 @@ impl SpotlightWindow {
         });
     }
 
-    // ---- action panel ----------------------------------------------------------------
-
-    fn panel_open(&self) -> bool {
-        self.panel.root.is_visible()
-    }
-
-    fn open_more_menu(self: &Rc<Self>) {
-        let menu_box = gtk4::Box::new(gtk4::Orientation::Vertical, 3);
-        menu_box.add_css_class("popover-menu-box");
-
-        // 1. Actions for currently selected item (if any)
-        if let Some(rd) = self.result_view.selected_row() {
-            let actions = self.actions_for(&rd);
-            if !actions.is_empty() {
-                for act in actions.into_iter().take(4) {
-                    let btn = gtk4::Button::new();
-                    btn.add_css_class("popover-item");
-                    let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-                    let label = gtk4::Label::builder().label(&act.title).xalign(0.0).hexpand(true).build();
-                    row_box.append(&label);
-                    if !act.keys.is_empty() {
-                        let k = gtk4::Label::builder().label(&act.keys.join("+")).build();
-                        k.add_css_class("keycap");
-                        row_box.append(&k);
-                    }
-                    btn.set_child(Some(&row_box));
-                    let s = self.clone();
-                    let a_id = act.id.clone();
-                    let a_argv = act.argv.clone();
-                    let rd_c = rd.clone();
-                    btn.connect_clicked(move |_| {
-                        s.more_popover.popdown();
-                        s.perform(rd_c.clone(), &a_id, a_argv.clone());
-                    });
-                    menu_box.append(&btn);
-                }
-                let sep = gtk4::Separator::new(gtk4::Orientation::Horizontal);
-                menu_box.append(&sep);
-            }
-        }
-
-        // 2. Global tools & options
-        let tools: &[(&str, &str, &str)] = &[
-            ("ui:quicklink_create", "Create Quicklink", "list-add-symbolic"),
-            ("ui:quicklink_manage", "Manage Quicklinks", "emblem-system-symbolic"),
-            ("ui:snippet_create", "Create Snippet", "insert-text-symbolic"),
-            ("ui:snippets", "Snippets", "edit-paste-symbolic"),
-            ("ui:windows", "Open Windows", "preferences-system-windows-symbolic"),
-            ("ui:emoji", "Emoji & Symbols", "face-smile-symbolic"),
-            ("cmd:settings", "System Settings", "preferences-system-symbolic"),
-        ];
-
-        for &(id, label_text, icon_name) in tools {
-            let btn = gtk4::Button::new();
-            btn.add_css_class("popover-item");
-            let row_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-            let img = gtk4::Image::from_icon_name(icon_name);
-            img.set_pixel_size(16);
-            let label = gtk4::Label::builder().label(label_text).xalign(0.0).hexpand(true).build();
-            row_box.append(&img);
-            row_box.append(&label);
-            btn.set_child(Some(&row_box));
-
-            let s = self.clone();
-            btn.connect_clicked(move |_| {
-                s.more_popover.popdown();
-                match id {
-                    "ui:quicklink_create" => s.quicklink_form(),
-                    "ui:quicklink_manage" => s.quicklink_manage(),
-                    "ui:snippet_create" => s.snippet_form(),
-                    "ui:snippets" => s.push_view(View::Snippets, "Search snippets\u{2026}"),
-                    "ui:windows" => s.push_view(View::Windows, "Filter open windows\u{2026}"),
-                    "ui:emoji" => s.open_emoji_panel(),
-                    "cmd:settings" => {
-                        let _ = std::process::Command::new("gnome-control-center").spawn();
-                    }
-                    _ => {}
-                }
-            });
-            menu_box.append(&btn);
-        }
-
-        self.more_popover.set_child(Some(&menu_box));
-        self.more_popover.popup();
-    }
-
-    fn open_panel(self: &Rc<Self>) {
-        if self.x.view.get() == View::Emoji {
-            self.open_emoji_panel();
-            return;
-        }
-        let Some(rd) = self.result_view.selected_row() else { return };
-        if self.history_mode.get() {
-            return;
-        }
-        *self.panel.all.borrow_mut() = self.actions_for(&rd);
-        *self.panel.target.borrow_mut() = Some(rd);
-        self.panel.entry.set_text("");
-        self.fill_panel("");
-        self.panel.root.set_visible(true);
-        self.panel.entry.grab_focus();
-    }
-
-    fn close_panel(&self) {
-        if self.panel.root.is_visible() {
-            self.panel.root.set_visible(false);
-            self.search_entry.grab_focus();
-        }
-    }
-
-    fn fill_panel(&self, filter: &str) {
-        let f = filter.trim().to_lowercase();
-        while let Some(c) = self.panel.list.first_child() {
-            self.panel.list.remove(&c);
-        }
-        let shown: Vec<UiAction> =
-            self.panel.all.borrow().iter().filter(|a| f.is_empty() || a.title.to_lowercase().contains(&f)).cloned().collect();
-        for a in &shown {
-            let row = gtk4::ListBoxRow::new();
-            let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
-            b.add_css_class("action-item");
-            if a.danger {
-                b.add_css_class("danger");
-            }
-            let t = gtk4::Label::builder().label(&a.title).xalign(0.0).hexpand(true).build();
-            t.add_css_class("action-title");
-            b.append(&t);
-            if !a.keys.is_empty() {
-                b.append(&keycap_row(&a.keys));
-            }
-            row.set_child(Some(&b));
-            self.panel.list.append(&row);
-        }
-        *self.panel.shown.borrow_mut() = shown;
-        if let Some(first) = self.panel.list.row_at_index(0) {
-            self.panel.list.select_row(Some(&first));
-        }
-    }
-
-    fn panel_step(&self, delta: i32) {
-        let n = self.panel.shown.borrow().len() as i32;
-        if n == 0 {
-            return;
-        }
-        let cur = self.panel.list.selected_row().map(|r| r.index()).unwrap_or(0);
-        let next = (cur + delta).rem_euclid(n);
-        if let Some(r) = self.panel.list.row_at_index(next) {
-            self.panel.list.select_row(Some(&r));
-        }
-    }
-
-    fn panel_activate(self: &Rc<Self>) {
-        let idx = self.panel.list.selected_row().map(|r| r.index()).unwrap_or(-1);
-        let act = self.panel.shown.borrow().get(idx.max(0) as usize).cloned();
-        let target = self.panel.target.borrow().clone();
-        if let (Some(a), Some(rd)) = (act, target) {
-            self.close_panel();
-            self.perform(rd, &a.id, a.argv);
-        }
-    }
-
-    fn setup_panel_events(self: &Rc<Self>) {
-        let s = self.clone();
-        self.panel.entry.connect_changed(move |e| s.fill_panel(&e.text()));
-        let s = self.clone();
-        self.panel.list.connect_row_activated(move |_, _| s.panel_activate());
-    }
-
-    // ---- dialog --------------------------------------------------------------------
-
-    fn show_dialog(
-        self: &Rc<Self>,
-        title: &str,
-        body: &str,
-        entry: Option<String>,
-        ok_label: &str,
-        destructive: bool,
-        on_ok: Box<dyn Fn(String)>,
-    ) {
-        self.close_panel();
-        self.dialog_reset_form();
-        self.dialog.title.set_label(title);
-        self.dialog.body.set_label(body);
-        self.dialog.ok.set_label(ok_label);
-        if destructive {
-            self.dialog.ok.add_css_class("destructive");
-        } else {
-            self.dialog.ok.remove_css_class("destructive");
-        }
-        match entry {
-            Some(text) => {
-                self.dialog.entry.set_text(&text);
-                self.dialog.entry.set_visible(true);
-            }
-            None => self.dialog.entry.set_visible(false),
-        }
-        *self.dialog.on_ok.borrow_mut() = Some(on_ok);
-        self.x.stack.set_visible(false);
-        self.dialog_backdrop.set_visible(true);
-        self.dialog.root.set_visible(true);
-        if gtk4::prelude::WidgetExt::is_visible(&self.dialog.entry) {
-            self.dialog.entry.grab_focus();
-            self.dialog.entry.set_position(-1);
-        } else {
-            self.dialog.ok.grab_focus();
-        }
-    }
-
-    fn dialog_open(&self) -> bool {
-        self.dialog.root.is_visible()
-    }
-
-    fn close_dialog(&self) {
-        if self.dialog.root.is_visible() {
-            self.dialog_backdrop.set_visible(false);
-            self.dialog.root.set_visible(false);
-            self.x.stack.set_visible(true);
-            self.dialog_reset_form();
-            *self.dialog.on_ok.borrow_mut() = None;
-            self.search_entry.grab_focus();
-        }
-    }
-
-    fn accept_dialog(self: &Rc<Self>) {
-        if self.accept_form() {
-            return;
-        }
-        let text = self.dialog.entry.text().to_string();
-        let cb = self.dialog.on_ok.borrow_mut().take();
-        self.close_dialog();
-        if let Some(cb) = cb {
-            cb(text);
-        }
-    }
-
-    // ---- zoom ------------------------------------------------------------------------
-
-    fn set_zoom(&self, z: f64) {
-        let z = ((z * 10.0).round() / 10.0).clamp(ZOOM_MIN, ZOOM_MAX);
-        self.zoom_provider.load_from_data(&zoom_css(z));
-        self.apply_size(z);
-        let mut c = self.config.borrow_mut();
-        c.zoom = z;
-        c.save();
-    }
-
     // ---- keyboard --------------------------------------------------------------------
 
     fn go_back(self: &Rc<Self>) {
@@ -2017,23 +1576,23 @@ impl SpotlightWindow {
             return;
         }
         // Clearing the query here is a step back, not a typed deletion.
-        self.query_typed.set(false);
+        self.nav_apply(NavEvent::Typed(false));
         if self.dialog_open() {
             self.close_dialog();
         } else if self.panel_open() {
             self.close_panel();
         } else if self.x.view.get() != View::Root {
             self.pop_view();
-        } else if self.calc_hist_mode.get() {
-            self.calc_hist_mode.set(false);
+        } else if self.in_calc_history() {
+            self.nav_apply(NavEvent::Back);
             self.search_entry.set_placeholder_text(Some(self.mode_name()));
             self.search_entry.set_text("");
             self.do_search(false);
-        } else if self.history_mode.get() {
-            self.history_mode.set(false);
+        } else if self.in_recent() {
+            self.nav_apply(NavEvent::Back);
             self.do_search(false);
-        } else if self.current_dir.borrow().is_some() {
-            *self.current_dir.borrow_mut() = None;
+        } else if self.nav.borrow().dir().is_some() {
+            self.nav_apply(NavEvent::Back);
             self.search_entry.set_text("");
             self.search_entry.set_placeholder_text(Some(self.mode_name()));
             self.do_search(false);
@@ -2105,9 +1664,7 @@ impl SpotlightWindow {
         if keyval == gdk::Key::Up && !mods.ctrl && !mods.alt && !mods.shift {
             if !self.result_view.step(-1)
                 && self.search_entry.text().is_empty()
-                && !self.history_mode.get()
-                && !self.calc_hist_mode.get()
-                && self.current_dir.borrow().is_none()
+                && self.nav.borrow().is_root()
             {
                 self.show_history();
             }
@@ -2130,15 +1687,11 @@ impl SpotlightWindow {
 
         // Backspace on empty: ascend directory
         if keyval == gdk::Key::BackSpace && self.search_entry.text().is_empty() {
-            let parent = self
-                .current_dir
-                .borrow()
-                .as_ref()
-                .and_then(|d| Path::new(d).parent().map(|p| (p.display().to_string(), d.clone())))
-                .filter(|(p, d)| p != d);
-            if let Some((parent, _)) = parent {
+            let before = self.nav.borrow().dir().map(str::to_string);
+            self.nav_apply(NavEvent::ParentDir);
+            let after = self.nav.borrow().dir().map(str::to_string);
+            if let Some(parent) = after.filter(|p| Some(p) != before.as_ref()) {
                 self.search_entry.set_placeholder_text(Some(&format!("Browsing: {}", parent)));
-                *self.current_dir.borrow_mut() = Some(parent);
                 self.do_search(false);
                 return glib::Propagation::Stop;
             }
@@ -2170,26 +1723,6 @@ impl SpotlightWindow {
 
     fn layout_ctx(&self) -> LayoutCtx {
         LayoutCtx { revealed: self.revealed.get(), pointer_origin: self.pointer_origin.get(), ..LayoutCtx::default() }
-    }
-
-    /// Context for Esc, Shift+Esc and the query-emptied event.
-    fn panel_ctx(&self) -> LayoutCtx {
-        let empty = self.search_entry.text().is_empty();
-        let sub_state = self.dialog_open()
-            || self.panel_open()
-            || self.x.view.get() != View::Root
-            || self.calc_hist_mode.get()
-            || self.history_mode.get()
-            || self.current_dir.borrow().is_some();
-        LayoutCtx {
-            mode_all: self.category.get() == Category::All,
-            query_empty: empty,
-            query_typed: self.query_typed.get(),
-            at_root: !sub_state && empty,
-            home_opened: self.home_opened.get(),
-            history_opened: self.history_opened.get(),
-            ..self.layout_ctx()
-        }
     }
 
     fn on_pointer(&self, x: f64, y: f64) {
@@ -2230,12 +1763,12 @@ impl SpotlightWindow {
         match layout::transition(self.layout.get(), &self.layout_ctx(), event).action {
             LayoutAction::ShowHome => {
                 self.apply_layout(LayoutState::Panel);
-                self.home_opened.set(true);
+                self.nav_apply(NavEvent::PanelOpened(Opened::Home));
                 self.do_search(false);
             }
             LayoutAction::ShowHistory => {
                 self.apply_layout(LayoutState::Panel);
-                self.history_opened.set(true);
+                self.nav_apply(NavEvent::PanelOpened(Opened::History));
                 if self.settings.borrow().history().is_empty() {
                     self.do_search(false);
                 } else {
@@ -2269,9 +1802,7 @@ impl SpotlightWindow {
             Act::Up => {
                 if !self.result_view.step(-1)
                     && self.search_entry.text().is_empty()
-                    && !self.history_mode.get()
-                    && !self.calc_hist_mode.get()
-                    && self.current_dir.borrow().is_none()
+                    && self.nav.borrow().is_root()
                 {
                     self.show_history();
                 }
