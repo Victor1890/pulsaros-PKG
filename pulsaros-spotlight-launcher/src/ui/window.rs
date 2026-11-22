@@ -363,7 +363,10 @@ impl SpotlightWindow {
         main_box.set_hexpand(true);
         // Clip children to the rounded corners (the CSS `overflow` property is not accepted by GTK).
         main_box.set_overflow(gtk4::Overflow::Hidden);
-        window.set_child(Some(&main_box));
+        // The bar buttons sit beside the pill, not inside it, so the pill contracts when they show.
+        let outer = gtk4::Box::new(gtk4::Orientation::Horizontal, MODE_GAP as i32);
+        outer.append(&main_box);
+        window.set_child(Some(&outer));
 
         // -- Search header: mode glyph, big light input, `...` disc --
         let search_container = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
@@ -413,7 +416,7 @@ impl SpotlightWindow {
             b.set_tooltip_text(Some(tip));
             mode_buttons.append(&b);
         }
-        search_container.append(&mode_buttons);
+        outer.append(&mode_buttons);
         main_box.append(&search_container);
 
         // -- Category bar (tabs) --
@@ -612,6 +615,7 @@ impl SpotlightWindow {
         main_box.append(&indexing_revealer);
 
         let panel_parts: Vec<gtk4::Widget> = vec![
+            more_button.clone().upcast(),
             category_scroll.clone().upcast(),
             loading_bar.clone().upcast(),
             overlay.clone().upcast(),
@@ -826,7 +830,11 @@ impl SpotlightWindow {
 
     fn apply_size(&self, zoom: f64) {
         let (w, h) = if self.layout.get() != LayoutState::Panel { (PILL_W, PILL_H) } else { (BASE_W, BASE_H) };
-        self.window.set_size_request((w as f64 * zoom) as i32, (h as f64 * zoom) as i32);
+        let (w, h) = ((w as f64 * zoom) as i32, (h as f64 * zoom) as i32);
+        self.window.set_size_request(w, h);
+        // The default size must follow too: a non-resizable window keeps its default height
+        // otherwise, so the pill stayed as tall as the Panel.
+        self.window.set_default_size(w, h);
     }
 
     // ---- loading bar / toast -------------------------------------------------
