@@ -6,7 +6,7 @@ use crate::config::SpotlightConfig;
 use crate::core::commands::{self, Command};
 use crate::core::frecency::Frecency;
 use crate::core::layout::{self, Action as LayoutAction, BarMode, Context as LayoutCtx, Event as LayoutEvent, LayoutState};
-use crate::core::root_search::{AppEntry, Ctx, Row, RowKind, RootSearch};
+use crate::core::root_search::{AppEntry, Ctx, Row, RowKind, RootSearch, SearchIndex};
 use crate::core::settings::Settings;
 use crate::core::shortcuts::{self, Act, Mods};
 use crate::core::store::Store;
@@ -90,6 +90,8 @@ pub struct SpotlightWindow {
     settings: RefCell<Settings>,
     frecency: RefCell<Frecency>,
     commands: RefCell<Vec<Command>>,
+    /// Apps and their ranker index, rebuilt after the next app reload (`None` = stale).
+    search_data: RefCell<Option<Rc<(Vec<AppEntry>, SearchIndex)>>>,
     x: Extras,
     states: RefCell<HashMap<String, bool>>,
     last_probe: Cell<Option<std::time::Instant>>,
@@ -132,11 +134,6 @@ pub struct SpotlightWindow {
     pointer_origin: Cell<Option<(f64, f64)>>,
     /// Everything below the header row; hidden while the layout is Idle.
     panel_parts: Vec<gtk4::Widget>,
-
-    indexing_revealer: gtk4::Revealer,
-    indexing_label: gtk4::Label,
-    indexing_pbar: gtk4::ProgressBar,
-    indexing_timer_id: Rc<RefCell<Option<glib::SourceId>>>,
 
     progress_revealer: gtk4::Revealer,
     progress_spinner: gtk4::Spinner,
@@ -491,31 +488,6 @@ impl SpotlightWindow {
         progress_box.append(&progress_label);
         progress_revealer.set_child(Some(&progress_box));
 
-        // -- Indexing banner --
-        let indexing_revealer = gtk4::Revealer::builder()
-            .transition_type(gtk4::RevealerTransitionType::SlideDown)
-            .transition_duration(200)
-            .reveal_child(false)
-            .build();
-        let indexing_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        indexing_box.add_css_class("indexing-status-bar");
-        let indexing_spinner = gtk4::Spinner::new();
-        indexing_spinner.start();
-        let indexing_label = gtk4::Label::builder()
-            .label("Indexing files in background...")
-            .xalign(0.0)
-            .hexpand(true)
-            .build();
-        let indexing_pbar = gtk4::ProgressBar::builder()
-            .valign(gtk4::Align::Center)
-            .width_request(100)
-            .height_request(4)
-            .build();
-        indexing_box.append(&indexing_spinner);
-        indexing_box.append(&indexing_label);
-        indexing_box.append(&indexing_pbar);
-        indexing_revealer.set_child(Some(&indexing_box));
-
         // -- Action panel --
         let panel_root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         panel_root.add_css_class("action-panel");
@@ -609,7 +581,6 @@ impl SpotlightWindow {
         overlay.add_overlay(&dialog_root);
         main_box.append(&overlay);
         main_box.append(&progress_revealer);
-        main_box.append(&indexing_revealer);
 
         let panel_parts: Vec<gtk4::Widget> = vec![
             more_button.clone().upcast(),
@@ -617,7 +588,6 @@ impl SpotlightWindow {
             loading_bar.clone().upcast(),
             overlay.clone().upcast(),
             progress_revealer.clone().upcast(),
-            indexing_revealer.clone().upcast(),
         ];
 
         let settings = Settings::load(&store);
@@ -642,6 +612,7 @@ impl SpotlightWindow {
             settings: RefCell::new(settings),
             frecency: RefCell::new(frecency),
             commands: RefCell::new(Vec::new()),
+            search_data: RefCell::new(None),
             x,
             states: RefCell::new(HashMap::new()),
             last_probe: Cell::new(None),
@@ -686,10 +657,6 @@ impl SpotlightWindow {
             history_opened: Cell::new(false),
             pointer_origin: Cell::new(None),
             panel_parts,
-            indexing_revealer,
-            indexing_label,
-            indexing_pbar,
-            indexing_timer_id: Rc::new(RefCell::new(None)),
             progress_revealer,
             progress_spinner,
             progress_label,
@@ -760,7 +727,6 @@ impl SpotlightWindow {
     /// focus-loss handler and the click-outside D-Bus request from the Shell extension.
     fn hide_window(self: &Rc<Self>) {
         self.window.set_visible(false);
-        self.stop_indexing_timer();
     }
 
     /// Entry point for the Shell extension's "click landed outside the window" report
@@ -820,7 +786,6 @@ impl SpotlightWindow {
         self.window.present();
         self.start_hypr_pointer_poll();
         self.search_entry.grab_focus();
-        self.start_indexing_timer();
         self.refresh_states();
         self.refresh_currencies();
         self.refresh_extras();
@@ -1018,65 +983,6 @@ impl SpotlightWindow {
         });
     }
 
-    // ---- indexing banner -----------------------------------------------------
-
-    fn start_indexing_timer(self: &Rc<Self>) {
-        if self.indexing_timer_id.borrow().is_none() && self.window.is_visible() {
-            let self_c = self.clone();
-            let id = glib::timeout_add_seconds_local(3, move || {
-                if !self_c.window.is_visible() {
-                    // Drop the handle and stop ticking; removing the source
-                    // from within its own callback is not safe
-                    *self_c.indexing_timer_id.borrow_mut() = None;
-                    return glib::ControlFlow::Break;
-                }
-                self_c.check_indexing_status();
-                glib::ControlFlow::Continue
-            });
-            *self.indexing_timer_id.borrow_mut() = Some(id);
-        }
-    }
-
-    fn stop_indexing_timer(&self) {
-        if let Some(id) = self.indexing_timer_id.borrow_mut().take() {
-            id.remove();
-        }
-    }
-
-    fn check_indexing_status(&self) {
-        let (sender, receiver) = std::sync::mpsc::channel::<(bool, String, f64)>();
-
-        let ind_revealer = self.indexing_revealer.clone();
-        let ind_label = self.indexing_label.clone();
-        let ind_pbar = self.indexing_pbar.clone();
-
-        glib::timeout_add_local(Duration::from_millis(5), move || match receiver.try_recv() {
-            Ok((is_indexing, _status, progress)) => {
-                if is_indexing {
-                    let percent = (progress * 100.0) as i32;
-                    let label_text = if percent > 0 {
-                        format!("Indexing files in background... ({}%)", percent)
-                    } else {
-                        "Indexing files in background...".to_string()
-                    };
-                    ind_label.set_text(&label_text);
-                    ind_pbar.set_fraction(progress.clamp(0.0, 1.0));
-                    ind_revealer.set_reveal_child(true);
-                } else {
-                    ind_revealer.set_reveal_child(false);
-                }
-                glib::ControlFlow::Break
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-        });
-
-        std::thread::spawn(move || {
-            let res = crate::search::get_indexing_status_plain();
-            let _ = sender.send(res);
-        });
-    }
-
     // ---- wiring ----------------------------------------------------------------
 
     fn setup_ui_interactions(self: &Rc<Self>) {
@@ -1132,6 +1038,7 @@ impl SpotlightWindow {
         self.backend.set_on_apps_updated(move || {
             let s = s.clone();
             glib::idle_add_local(move || {
+                *s.search_data.borrow_mut() = None;
                 if s.window.is_visible() {
                     s.do_search(true);
                 }
@@ -1205,13 +1112,21 @@ impl SpotlightWindow {
     }
 
     fn core_sections(&self, query: &str, extra: &[Row]) -> SectionList {
-        let apps: Vec<AppEntry> = self.backend.apps_snapshot().iter().map(app_entry).collect();
+        let commands = self.commands.borrow();
+        let data = self
+            .search_data
+            .borrow_mut()
+            .get_or_insert_with(|| {
+                let apps: Vec<AppEntry> = self.backend.apps_snapshot().iter().map(app_entry).collect();
+                let index = SearchIndex::new(&apps, &commands);
+                Rc::new((apps, index))
+            })
+            .clone();
         let settings = self.settings.borrow();
         let frecency = self.frecency.borrow();
         let states = self.states.borrow();
-        let commands = self.commands.borrow();
         let ctx = Ctx {
-            apps: &apps,
+            apps: &data.0,
             commands: &commands,
             states: &states,
             settings: &settings,
@@ -1219,7 +1134,7 @@ impl SpotlightWindow {
             now: now_secs(),
             extra,
         };
-        RootSearch::sections(query, &ctx)
+        RootSearch::sections_indexed(query, &ctx, &data.1)
             .into_iter()
             .map(|s| (s.title, s.rows.into_iter().map(|row| RowData { row, payload: None, calc: None }).collect()))
             .collect()
@@ -1284,10 +1199,9 @@ impl SpotlightWindow {
             Category::All | Category::Applications | Category::Actions => {
                 let found: Vec<SearchResult> = if category == Category::All && !is_empty {
                     self.backend
-                        .search_instant(&query, Category::All, DEFAULT_LIMIT)
-                        .into_iter()
-                        .filter(|r| r.app.is_none() && r.url.starts_with("clipboard://"))
-                        .collect()
+                        .clipboard()
+                        .map(|mgr| mgr.search_history(&query).into_iter().take(3).collect())
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 };
