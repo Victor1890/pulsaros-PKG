@@ -9,8 +9,8 @@ use crate::core::root_search::{AppEntry, Ctx, Row, RowKind, RootSearch};
 use crate::core::settings::Settings;
 use crate::core::shortcuts::{self, Act, Mods};
 use crate::core::store::Store;
-use crate::search::{SearchBackend, SearchResult, DEFAULT_LIMIT};
-use crate::ui::results::{get_favorites, set_favorites, ResultView, RowData};
+use crate::search::{SearchBackend, DEFAULT_LIMIT};
+use crate::ui::results::{get_favorites, result_row, set_favorites, Payload, ResultView, RowData};
 use crate::utils::{get_icon_dir, get_local_icon_dir, open_file};
 use gtk4::gdk;
 use gtk4::glib;
@@ -236,21 +236,6 @@ pub(crate) fn primary_title(r: &RowData) -> String {
             }
         }
     }
-}
-
-fn row_from_result(res: &SearchResult) -> RowData {
-    let (kind, id, icon) = if let Some(v) = res.url.strip_prefix("calc://") {
-        (RowKind::Calc, format!("calc:{v}"), "accessories-calculator-symbolic")
-    } else if res.url.starts_with("clipboard://") {
-        (RowKind::Clipboard, res.url.clone(), "edit-paste-symbolic")
-    } else {
-        (RowKind::File, res.url.clone(), "text-x-generic")
-    };
-    let mut sub = res.snippet.clone();
-    if sub.is_empty() {
-        sub = res.url.trim_start_matches("file://").to_string();
-    }
-    RowData { row: Row::simple(kind, &id, &res.title, &sub, icon), payload: Some(res.clone()), calc: None }
 }
 
 fn calc_row(c: &CalcResult, id: String) -> RowData {
@@ -1273,8 +1258,7 @@ impl SpotlightWindow {
 
         let browsing_dir = self.current_dir.borrow().clone();
         if let Some(dir_path) = browsing_dir.as_ref() {
-            let rows: Vec<RowData> =
-                browse_directory_plain(dir_path, query.trim()).iter().map(row_from_result).collect();
+            let rows = browse_directory_plain(dir_path, query.trim());
             *self.current.borrow_mut() = vec![("Files".to_string(), rows)];
             self.render(keep);
             return;
@@ -1305,11 +1289,11 @@ impl SpotlightWindow {
         }
         let sections: SectionList = match category.as_str() {
             "all" | "applications" | "actions" => {
-                let found: Vec<SearchResult> = if category == "all" && !is_empty {
+                let found: Vec<RowData> = if category == "all" && !is_empty {
                     self.backend
                         .search_instant(&query, "all", DEFAULT_LIMIT)
                         .into_iter()
-                        .filter(|r| r.app.is_none() && r.url.starts_with("clipboard://"))
+                        .filter(|r| r.row.kind == RowKind::Clipboard)
                         .collect()
                 } else {
                     Vec::new()
@@ -1323,9 +1307,9 @@ impl SpotlightWindow {
                 if ql.len() >= 3 && "calculator history".contains(&ql) {
                     extra.push(Row::simple(RowKind::Command, "calc:history", "Calculator History", "Calculator", "accessories-calculator-symbolic"));
                 }
-                extra.extend(found.iter().map(|r| row_from_result(r).row));
-                let payloads: HashMap<String, SearchResult> =
-                    found.into_iter().map(|r| (row_from_result(&r).row.id, r)).collect();
+                extra.extend(found.iter().map(|r| r.row.clone()));
+                let payloads: HashMap<String, Payload> =
+                    found.into_iter().filter_map(|r| r.payload.map(|p| (r.row.id, p))).collect();
                 let mut secs = self.core_sections(&query, &extra);
                 if category == "all" && !is_empty {
                     self.add_extra_rows(&query, &mut secs);
@@ -1356,12 +1340,11 @@ impl SpotlightWindow {
                 secs
             }
             "clipboard" => {
-                let rows: Vec<RowData> =
-                    self.backend.search_instant(&query, "clipboard", DEFAULT_LIMIT).iter().map(row_from_result).collect();
+                let rows = self.backend.search_instant(&query, "clipboard", DEFAULT_LIMIT);
                 vec![("Clipboard".to_string(), rows)]
             }
             "web" => {
-                let rows: Vec<RowData> = self.backend.search_web(&query).iter().map(row_from_result).collect();
+                let rows = self.backend.search_web(&query);
                 vec![("Web".to_string(), rows)]
             }
             "calc" => {
@@ -1404,8 +1387,7 @@ impl SpotlightWindow {
             let s = self.clone();
             self.backend.search_async(&query, &category, DEFAULT_LIMIT, move |file_results| {
                 s.loading_end();
-                let rows = file_results.iter().map(row_from_result).collect();
-                s.append_rows(seq, target, rows);
+                s.append_rows(seq, target, file_results);
             });
         }
 
@@ -1418,8 +1400,7 @@ impl SpotlightWindow {
             let title = if category == "web" { "Web" } else { "Results" };
             self.backend.search_browser_history_async(&query, limit, move |hist| {
                 s.loading_end();
-                let rows = hist.iter().map(row_from_result).collect();
-                s.append_rows(seq, title, rows);
+                s.append_rows(seq, title, hist);
             });
         }
     }
@@ -1845,7 +1826,7 @@ impl SpotlightWindow {
     }
 
     /// Returns true when the window should hide afterwards.
-    fn open_result(self: &Rc<Self>, res: &SearchResult) -> bool {
+    fn open_result(self: &Rc<Self>, res: &Payload) -> bool {
         if let Some(val) = res.url.strip_prefix("calc://") {
             self.copy(val);
             return true;
@@ -2508,7 +2489,7 @@ fn bar_event(keyval: gdk::Key, mods: Mods, act: Option<Act>) -> Option<LayoutEve
     }
 }
 
-fn browse_directory_plain(path_str: &str, filter: &str) -> Vec<SearchResult> {
+fn browse_directory_plain(path_str: &str, filter: &str) -> Vec<RowData> {
     let mut results = Vec::new();
     let p = Path::new(path_str);
     if !p.is_dir() {
@@ -2518,13 +2499,13 @@ fn browse_directory_plain(path_str: &str, filter: &str) -> Vec<SearchResult> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     // Parent navigation
     if p != home && p.parent().is_some() {
-        results.push(SearchResult {
-            url: format!("file://{}", p.parent().unwrap().display()),
-            title: ".. (Parent directory)".to_string(),
-            mime: "inode/directory".to_string(),
-            snippet: p.parent().unwrap().display().to_string(),
-            app: None,
-        });
+        results.push(result_row(
+            format!("file://{}", p.parent().unwrap().display()),
+            ".. (Parent directory)".to_string(),
+            "inode/directory".to_string(),
+            p.parent().unwrap().display().to_string(),
+            None,
+        ));
     }
 
     if let Ok(entries) = std::fs::read_dir(p) {
@@ -2543,13 +2524,13 @@ fn browse_directory_plain(path_str: &str, filter: &str) -> Vec<SearchResult> {
             let is_dir = entry.file_type().map_or(false, |t| t.is_dir());
             let mime = if is_dir { "inode/directory".to_string() } else { "application/octet-stream".to_string() };
 
-            results.push(SearchResult {
-                url: format!("file://{}", entry.path().display()),
-                title: name,
+            results.push(result_row(
+                format!("file://{}", entry.path().display()),
+                name,
                 mime,
-                snippet: entry.path().display().to_string(),
-                app: None,
-            });
+                entry.path().display().to_string(),
+                None,
+            ));
         }
     }
 

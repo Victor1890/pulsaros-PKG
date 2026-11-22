@@ -1,6 +1,7 @@
 use crate::apps::{DesktopApp, load_apps};
 use crate::calculator::Calculator;
 use crate::clipboard::ClipboardManager;
+use crate::ui::results::{result_row, RowData};
 use rusqlite::{Connection as SqliteConnection, OpenFlags};
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -10,15 +11,6 @@ use std::thread;
 use zbus::blocking::Connection as ZbusConnection;
 
 pub const DEFAULT_LIMIT: usize = 500;
-
-#[derive(Clone, Debug)]
-pub struct SearchResult {
-    pub url: String,
-    pub title: String,
-    pub mime: String,
-    pub snippet: String,
-    pub app: Option<DesktopApp>,
-}
 
 #[derive(Clone)]
 pub struct SearchBackend {
@@ -92,7 +84,7 @@ impl SearchBackend {
         get_indexing_status_plain()
     }
 
-    pub fn search_instant(&self, query: &str, category: &str, limit: usize) -> Vec<SearchResult> {
+    pub fn search_instant(&self, query: &str, category: &str, limit: usize) -> Vec<RowData> {
         if category == "clipboard" {
             if let Some(mgr) = &self.clipboard_mgr {
                 return mgr.search_history(query);
@@ -120,13 +112,13 @@ impl SearchBackend {
             // 1. Calculator
             let calc_eval = Calculator::evaluate(q_clean);
             if let Some((val_str, snippet)) = &calc_eval {
-                results.push(SearchResult {
-                    url: format!("calc://{}", val_str),
-                    title: val_str.clone(),
-                    mime: "application/x-calculator".to_string(),
-                    snippet: snippet.clone(),
-                    app: None,
-                });
+                results.push(result_row(
+                    format!("calc://{}", val_str),
+                    val_str.clone(),
+                    "application/x-calculator".to_string(),
+                    snippet.clone(),
+                    None,
+                ));
             }
 
             // 2. Clipboard (top 3)
@@ -154,13 +146,13 @@ impl SearchBackend {
 
     pub fn search_browser_history_async<F>(&self, query: &str, limit: usize, callback: F)
     where
-        F: Fn(Vec<SearchResult>) + 'static,
+        F: Fn(Vec<RowData>) + 'static,
     {
         let query = query.to_string();
         run_async(move || query_browser_history_plain(&query, limit), callback);
     }
 
-    pub fn search_web(&self, query: &str) -> Vec<SearchResult> {
+    pub fn search_web(&self, query: &str) -> Vec<RowData> {
         // Instant web result (Google new-tab link). Browser-history lookup is
         // intentionally NOT done here: it opens SQLite on the UI thread and can
         // block on a locked places.sqlite. It runs asynchronously via
@@ -170,48 +162,28 @@ impl SearchBackend {
 
         if !q_strip.is_empty() {
             let encoded = urlencoding::encode(q_strip);
-            results.push(SearchResult {
-                url: format!("https://www.google.com/search?q={}", encoded),
-                title: format!("Search '{}' on the Web", q_strip),
-                mime: "text/html".to_string(),
-                snippet: format!("Open Google search for '{}'", q_strip),
-                app: None,
-            });
+            results.push(result_row(
+                format!("https://www.google.com/search?q={}", encoded),
+                format!("Search '{}' on the Web", q_strip),
+                "text/html".to_string(),
+                format!("Open Google search for '{}'", q_strip),
+                None,
+            ));
         } else {
-            results.push(SearchResult {
-                url: "https://www.google.com".to_string(),
-                title: "Google".to_string(),
-                mime: "text/html".to_string(),
-                snippet: "https://www.google.com".to_string(),
-                app: None,
-            });
-            results.push(SearchResult {
-                url: "https://github.com".to_string(),
-                title: "GitHub".to_string(),
-                mime: "text/html".to_string(),
-                snippet: "https://github.com".to_string(),
-                app: None,
-            });
-            results.push(SearchResult {
-                url: "https://youtube.com".to_string(),
-                title: "YouTube".to_string(),
-                mime: "text/html".to_string(),
-                snippet: "https://youtube.com".to_string(),
-                app: None,
-            });
-            results.push(SearchResult {
-                url: "https://wikipedia.org".to_string(),
-                title: "Wikipedia".to_string(),
-                mime: "text/html".to_string(),
-                snippet: "https://wikipedia.org".to_string(),
-                app: None,
-            });
+            for (url, title) in [
+                ("https://www.google.com", "Google"),
+                ("https://github.com", "GitHub"),
+                ("https://youtube.com", "YouTube"),
+                ("https://wikipedia.org", "Wikipedia"),
+            ] {
+                results.push(result_row(url.to_string(), title.to_string(), "text/html".to_string(), url.to_string(), None));
+            }
         }
 
         results
     }
 
-    pub fn search_apps(&self, query: &str, limit: usize) -> Vec<SearchResult> {
+    pub fn search_apps(&self, query: &str, limit: usize) -> Vec<RowData> {
         let q_lower = query.to_lowercase();
         let apps = self.apps.borrow();
         let mut results = Vec::new();
@@ -223,17 +195,13 @@ impl SearchBackend {
                 || app.lower_keywords.contains(&q_lower)
                 || app.filename.to_lowercase().contains(&q_lower)
             {
-                results.push(SearchResult {
-                    url: format!("app://{}", app.filename),
-                    title: app.name.clone(),
-                    mime: "application/x-desktop".to_string(),
-                    snippet: if !app.comment.is_empty() {
-                        app.comment.clone()
-                    } else {
-                        app.filename.clone()
-                    },
-                    app: Some(app.clone()),
-                });
+                results.push(result_row(
+                    format!("app://{}", app.filename),
+                    app.name.clone(),
+                    "application/x-desktop".to_string(),
+                    if !app.comment.is_empty() { app.comment.clone() } else { app.filename.clone() },
+                    Some(app.clone()),
+                ));
 
                 if results.len() >= limit {
                     break;
@@ -245,7 +213,7 @@ impl SearchBackend {
     }
 
     #[allow(dead_code)]
-    pub fn search_sync(&self, query: &str, category: &str, limit: usize) -> Vec<SearchResult> {
+    pub fn search_sync(&self, query: &str, category: &str, limit: usize) -> Vec<RowData> {
         let mut results = self.search_instant(query, category, limit);
         if category == "apps" || category == "applications" || category == "clipboard" || category == "web" {
             return results;
@@ -257,7 +225,7 @@ impl SearchBackend {
 
     pub fn search_async<F>(&self, query: &str, category: &str, limit: usize, callback: F)
     where
-        F: Fn(Vec<SearchResult>) + 'static,
+        F: Fn(Vec<RowData>) + 'static,
     {
         if category == "apps" || category == "applications" || category == "clipboard" || category == "web" {
             gtk4::glib::idle_add_local(move || {
@@ -273,14 +241,14 @@ impl SearchBackend {
     }
 
     #[allow(dead_code)]
-    fn execute_sparql(&self, sparql: &str) -> Vec<SearchResult> {
+    fn execute_sparql(&self, sparql: &str) -> Vec<RowData> {
         execute_sparql_external(sparql)
     }
 }
 
 thread_local! {
     /// Callbacks waiting for a worker result, keyed by job id. Touched only on the GTK main thread.
-    static PENDING: RefCell<std::collections::HashMap<u64, Box<dyn FnOnce(Vec<SearchResult>)>>> =
+    static PENDING: RefCell<std::collections::HashMap<u64, Box<dyn FnOnce(Vec<RowData>)>>> =
         RefCell::new(std::collections::HashMap::new());
     static NEXT_JOB: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -290,8 +258,8 @@ thread_local! {
 /// polling timer exists while a search is pending. `callback` is always called exactly once.
 fn run_async<J, F>(job: J, callback: F)
 where
-    J: FnOnce() -> Vec<SearchResult> + Send + 'static,
-    F: FnOnce(Vec<SearchResult>) + 'static,
+    J: FnOnce() -> Vec<RowData> + Send + 'static,
+    F: FnOnce(Vec<RowData>) + 'static,
 {
     let id = NEXT_JOB.with(|n| {
         let id = n.get();
@@ -343,7 +311,7 @@ pub fn matches_category(filename: &str, category: &str) -> bool {
     }
 }
 
-pub fn search_nautilus(query: &str, category: &str, limit: usize) -> Vec<SearchResult> {
+pub fn search_nautilus(query: &str, category: &str, limit: usize) -> Vec<RowData> {
     let mut results = Vec::new();
     let q_trimmed = query.trim();
     if q_trimmed.is_empty() {
@@ -408,20 +376,14 @@ pub fn search_nautilus(query: &str, category: &str, limit: usize) -> Vec<SearchR
             clean_url.to_string()
         };
 
-        results.push(SearchResult {
-            url,
-            title,
-            mime,
-            snippet: path_display,
-            app: None,
-        });
+        results.push(result_row(url, title, mime, path_display, None));
 
         if results.len() >= limit {
             break;
         }
     }
 
-    results.sort_unstable_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    results.sort_unstable_by(|a, b| a.row.title.to_lowercase().cmp(&b.row.title.to_lowercase()));
     results
 }
 
@@ -473,7 +435,7 @@ fn walk_shallow(dir: &std::path::Path, query: &str, results: &mut Vec<String>, l
     }
 }
 
-fn execute_sparql_external(sparql: &str) -> Vec<SearchResult> {
+fn execute_sparql_external(sparql: &str) -> Vec<RowData> {
     let mut results = Vec::new();
 
     let output = Command::new("tinysparql")
@@ -513,18 +475,12 @@ fn execute_sparql_external(sparql: &str) -> Vec<SearchResult> {
                     .unwrap_or("application/octet-stream")
                     .to_string();
 
-                results.push(SearchResult {
-                    url,
-                    title,
-                    mime,
-                    snippet: String::new(),
-                    app: None,
-                });
+                results.push(result_row(url, title, mime, String::new(), None));
             }
         }
     }
 
-    results.sort_unstable_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    results.sort_unstable_by(|a, b| a.row.title.to_lowercase().cmp(&b.row.title.to_lowercase()));
     results
 }
 
@@ -534,7 +490,7 @@ pub fn get_indexing_status_plain() -> (bool, String, f64) {
     (false, "Idle".to_string(), 1.0)
 }
 
-fn query_browser_history_plain(query: &str, limit: usize) -> Vec<SearchResult> {
+fn query_browser_history_plain(query: &str, limit: usize) -> Vec<RowData> {
     let mut results = Vec::new();
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/home/jaime"));
 
@@ -593,13 +549,7 @@ fn query_browser_history_plain(query: &str, limit: usize) -> Vec<SearchResult> {
 
                 for (url, title) in rows {
                     let title = title.unwrap_or_else(|| url.clone());
-                    results.push(SearchResult {
-                        title,
-                        snippet: url.clone(),
-                        url,
-                        mime: "text/html".to_string(),
-                        app: None,
-                    });
+                    results.push(result_row(url.clone(), title, "text/html".to_string(), url, None));
                 }
             }
         }

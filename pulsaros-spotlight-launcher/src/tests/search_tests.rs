@@ -33,7 +33,7 @@ fn run_async_delivers_result_on_the_main_context_without_polling() {
     let got: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
     let g = got.clone();
     run_async(
-        || vec![SearchResult { url: "u".into(), title: "t".into(), mime: "m".into(), snippet: "s".into(), app: None }],
+        || vec![result_row("u".into(), "t".into(), "m".into(), "s".into(), None)],
         move |r| g.set(Some(r.len())),
     );
     let start = std::time::Instant::now();
