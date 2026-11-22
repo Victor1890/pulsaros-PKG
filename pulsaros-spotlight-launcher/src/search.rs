@@ -1,10 +1,10 @@
 use crate::apps::{DesktopApp, load_apps};
 use crate::calculator::Calculator;
 use crate::clipboard::ClipboardManager;
+use crate::core::debounce::{Debounce, RELOAD_DELAY_MS};
 use rusqlite::{Connection as SqliteConnection, OpenFlags};
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::process::Command;
 use std::rc::Rc;
 use std::thread;
 use zbus::blocking::Connection as ZbusConnection;
@@ -58,6 +58,7 @@ impl SearchBackend {
 
         let dirs = crate::apps::get_desktop_dirs();
         let mut monitors_borrow = self.monitors.borrow_mut();
+        let debounce = Rc::new(RefCell::new(Debounce::default()));
 
         for dir in dirs {
             if dir.is_dir() {
@@ -65,12 +66,30 @@ impl SearchBackend {
                 if let Ok(monitor) = gfile.monitor_directory(gio::FileMonitorFlags::NONE, None::<&gio::Cancellable>) {
                     let apps_c = self.apps.clone();
                     let cb_c = self.on_apps_updated.clone();
+                    let debounce_c = debounce.clone();
                     monitor.connect_changed(move |_, _, _, event_type| {
                         if event_type == gio::FileMonitorEvent::Changed || event_type == gio::FileMonitorEvent::Created || event_type == gio::FileMonitorEvent::Deleted {
-                            *apps_c.borrow_mut() = load_apps();
-                            if let Some(cb) = &*cb_c.borrow() {
-                                cb();
+                            if !debounce_c.borrow_mut().trigger() {
+                                return;
                             }
+                            let apps_c = apps_c.clone();
+                            let cb_c = cb_c.clone();
+                            let debounce_c = debounce_c.clone();
+                            gtk4::glib::timeout_add_local_once(
+                                std::time::Duration::from_millis(RELOAD_DELAY_MS),
+                                move || {
+                                    debounce_c.borrow_mut().fire();
+                                    gtk4::glib::spawn_future_local(async move {
+                                        // load_apps() parses files: keep it off the GTK main thread.
+                                        if let Ok(apps) = gio::spawn_blocking(load_apps).await {
+                                            *apps_c.borrow_mut() = apps;
+                                            if let Some(cb) = &*cb_c.borrow() {
+                                                cb();
+                                            }
+                                        }
+                                    });
+                                },
+                            );
                         }
                     });
                     monitors_borrow.push(monitor);
@@ -85,11 +104,6 @@ impl SearchBackend {
 
     pub fn apps_snapshot(&self) -> Vec<DesktopApp> {
         self.apps.borrow().clone()
-    }
-
-    #[allow(dead_code)]
-    pub fn get_indexing_status(&self) -> (bool, String, f64) {
-        get_indexing_status_plain()
     }
 
     pub fn search_instant(&self, query: &str, category: &str, limit: usize) -> Vec<SearchResult> {
@@ -244,17 +258,6 @@ impl SearchBackend {
         results
     }
 
-    #[allow(dead_code)]
-    pub fn search_sync(&self, query: &str, category: &str, limit: usize) -> Vec<SearchResult> {
-        let mut results = self.search_instant(query, category, limit);
-        if category == "apps" || category == "applications" || category == "clipboard" || category == "web" {
-            return results;
-        }
-
-        results.extend(search_nautilus(query, category, limit));
-        results
-    }
-
     pub fn search_async<F>(&self, query: &str, category: &str, limit: usize, callback: F)
     where
         F: Fn(Vec<SearchResult>) + 'static,
@@ -270,11 +273,6 @@ impl SearchBackend {
         let query = query.to_string();
         let category = category.to_string();
         run_async(move || search_nautilus(&query, &category, limit), callback);
-    }
-
-    #[allow(dead_code)]
-    fn execute_sparql(&self, sparql: &str) -> Vec<SearchResult> {
-        execute_sparql_external(sparql)
     }
 }
 
@@ -428,7 +426,7 @@ pub fn search_nautilus(query: &str, category: &str, limit: usize) -> Vec<SearchR
 fn fallback_file_search(query: &str, limit: usize) -> Vec<String> {
     let q_lower = query.to_lowercase();
     let mut results = Vec::new();
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/home/jaime"));
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let search_roots = [
         dirs::document_dir().unwrap_or_else(|| home.join("Documents")),
         dirs::download_dir().unwrap_or_else(|| home.join("Downloads")),
@@ -473,70 +471,9 @@ fn walk_shallow(dir: &std::path::Path, query: &str, results: &mut Vec<String>, l
     }
 }
 
-fn execute_sparql_external(sparql: &str) -> Vec<SearchResult> {
-    let mut results = Vec::new();
-
-    let output = Command::new("tinysparql")
-        .args(&["query", "-b", "org.freedesktop.LocalSearch3", "-q", sparql])
-        .output()
-        .or_else(|_| {
-            Command::new("tracker3")
-                .args(&["sparql", "-q", sparql])
-                .output()
-        });
-
-    if let Ok(output) = output {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with("Resultados:") || trimmed.starts_with("Results:") {
-                continue;
-            }
-
-            if trimmed.starts_with("file://") || trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-                let url = trimmed.to_string();
-                if seen.contains(&url) {
-                    continue;
-                }
-                seen.insert(url.clone());
-                let clean_url = url.trim_end_matches('/');
-                let filename_part = clean_url.split('/').last().unwrap_or(clean_url);
-                let title = match urlencoding::decode(filename_part) {
-                    Ok(decoded) if !decoded.trim().is_empty() => decoded.into_owned(),
-                    _ => filename_part.to_string(),
-                };
-
-                let mime = mime_guess::from_path(&title)
-                    .first_raw()
-                    .unwrap_or("application/octet-stream")
-                    .to_string();
-
-                results.push(SearchResult {
-                    url,
-                    title,
-                    mime,
-                    snippet: String::new(),
-                    app: None,
-                });
-            }
-        }
-    }
-
-    results.sort_unstable_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-    results
-}
-
-pub fn get_indexing_status_plain() -> (bool, String, f64) {
-    // Localsearch / Tracker daemon is disabled in Pulsar OS to save CPU/battery.
-    // Nautilus search engine handles file queries without background indexing.
-    (false, "Idle".to_string(), 1.0)
-}
-
 fn query_browser_history_plain(query: &str, limit: usize) -> Vec<SearchResult> {
     let mut results = Vec::new();
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/home/jaime"));
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
 
     let mut paths = Vec::new();
     paths.push(home.join(".mozilla/seafari-profile/places.sqlite"));
