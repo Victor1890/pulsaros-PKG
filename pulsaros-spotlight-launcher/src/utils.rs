@@ -2,10 +2,9 @@ use gtk4::gio;
 use gtk4::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use lazy_static::lazy_static;
+use std::sync::LazyLock;
 
-lazy_static! {
-    static ref EXT_MAP: HashMap<&'static str, &'static str> = {
+static EXT_MAP: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
         let mut m = HashMap::new();
         m.insert("py", "file_python.svg");
         m.insert("pyw", "file_python.svg");
@@ -65,8 +64,7 @@ lazy_static! {
         m.insert("pkg", "file_package.svg");
         m.insert("deb", "file_package.svg");
         m
-    };
-}
+});
 
 pub fn open_file(url: &str) -> bool {
     if url.starts_with("app://") {
@@ -75,8 +73,9 @@ pub fn open_file(url: &str) -> bool {
             return app_info.launch(&[], None::<&gio::AppLaunchContext>).is_ok();
         }
         // Fallback search
-        for dir in &["/usr/share/applications", "/home/jaime/.local/share/applications"] {
-            let path = Path::new(dir).join(desktop_filename);
+        let user_apps = dirs::data_dir().map(|d| d.join("applications"));
+        for dir in std::iter::once(PathBuf::from("/usr/share/applications")).chain(user_apps) {
+            let path = dir.join(desktop_filename);
             if path.exists() {
                 if let Some(app_info) = gio::DesktopAppInfo::from_filename(path) {
                     return app_info.launch(&[], None::<&gio::AppLaunchContext>).is_ok();
