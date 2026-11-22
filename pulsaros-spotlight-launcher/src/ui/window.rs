@@ -1,3 +1,4 @@
+use adw::prelude::AnimationExt as _;
 use crate::calculator::{CalcHistory, CalcResult, Calculator};
 use crate::clipboard::ClipboardManager;
 use crate::config::SpotlightConfig;
@@ -129,6 +130,8 @@ pub struct SpotlightWindow {
     layout: Cell<LayoutState>,
     /// The four round mode buttons; visible only in `IdleModes`.
     mode_buttons: gtk4::Box,
+    buttons_revealer: gtk4::Revealer,
+    size_anim: RefCell<Option<adw::TimedAnimation>>,
     /// The buttons were shown at some point since the window opened.
     revealed: Cell<bool>,
     /// The query text came from the user's typing (not from a mode or a view).
@@ -364,7 +367,7 @@ impl SpotlightWindow {
         // Clip children to the rounded corners (the CSS `overflow` property is not accepted by GTK).
         main_box.set_overflow(gtk4::Overflow::Hidden);
         // The bar buttons sit beside the pill, not inside it, so the pill contracts when they show.
-        let outer = gtk4::Box::new(gtk4::Orientation::Horizontal, MODE_GAP as i32);
+        let outer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         outer.append(&main_box);
         window.set_child(Some(&outer));
 
@@ -402,7 +405,13 @@ impl SpotlightWindow {
 
         let mode_buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, MODE_GAP as i32);
         mode_buttons.add_css_class("mode-buttons");
-        mode_buttons.set_visible(false);
+        mode_buttons.set_margin_start(MODE_GAP as i32);
+        let buttons_revealer = gtk4::Revealer::builder()
+            .transition_type(gtk4::RevealerTransitionType::SlideLeft)
+            .transition_duration(200)
+            .reveal_child(false)
+            .child(&mode_buttons)
+            .build();
         for (n, tip) in BAR_BUTTONS {
             let img = gtk4::Image::new();
             img.set_pixel_size(26);
@@ -416,7 +425,7 @@ impl SpotlightWindow {
             b.set_tooltip_text(Some(tip));
             mode_buttons.append(&b);
         }
-        outer.append(&mode_buttons);
+        outer.append(&buttons_revealer);
         main_box.append(&search_container);
 
         // -- Category bar (tabs) --
@@ -679,6 +688,8 @@ impl SpotlightWindow {
             zoom_provider,
             layout: Cell::new(LayoutState::Idle),
             mode_buttons,
+            buttons_revealer,
+            size_anim: RefCell::new(None),
             revealed: Cell::new(false),
             query_typed: Cell::new(false),
             home_opened: Cell::new(false),
@@ -807,7 +818,7 @@ impl SpotlightWindow {
     fn apply_layout(&self, state: LayoutState) {
         self.layout.set(state);
         let idle = state != LayoutState::Panel;
-        self.mode_buttons.set_visible(state == LayoutState::IdleModes);
+        self.buttons_revealer.set_reveal_child(state == LayoutState::IdleModes);
         if state == LayoutState::IdleModes {
             self.revealed.set(true);
         }
@@ -831,10 +842,30 @@ impl SpotlightWindow {
     fn apply_size(&self, zoom: f64) {
         let (w, h) = if self.layout.get() != LayoutState::Panel { (PILL_W, PILL_H) } else { (BASE_W, BASE_H) };
         let (w, h) = ((w as f64 * zoom) as i32, (h as f64 * zoom) as i32);
-        self.window.set_size_request(w, h);
-        // The default size must follow too: a non-resizable window keeps its default height
-        // otherwise, so the pill stayed as tall as the Panel.
-        self.window.set_default_size(w, h);
+        // The size request is only a minimum, so the default size must follow too: a
+        // non-resizable window keeps its default height otherwise.
+        let set = {
+            let win = self.window.clone();
+            move |height: i32| {
+                win.set_size_request(w, height);
+                win.set_default_size(w, height);
+            }
+        };
+        if let Some(a) = self.size_anim.borrow_mut().take() {
+            a.pause();
+        }
+        let from = self.window.height();
+        if from <= 0 || from == h || !self.window.is_visible() {
+            set(h);
+            return;
+        }
+        // Grow or shrink between the pill and the Panel in 200 ms (libadwaita honours
+        // `gtk-enable-animations`, so this snaps when animations are off).
+        let target = adw::CallbackAnimationTarget::new(move |v| set(v.round() as i32));
+        let anim = adw::TimedAnimation::new(&self.window, from as f64, h as f64, 200, target);
+        anim.set_easing(adw::Easing::EaseOutCubic);
+        anim.play();
+        *self.size_anim.borrow_mut() = Some(anim);
     }
 
     // ---- loading bar / toast -------------------------------------------------
