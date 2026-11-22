@@ -44,20 +44,19 @@ impl SpotlightWindow {
 
     /// Context for Esc, Shift+Esc and the query-emptied event.
     pub(super) fn panel_ctx(&self) -> LayoutCtx {
+        let nav = self.nav.borrow().clone();
         let empty = self.search_entry.text().is_empty();
         let sub_state = self.dialog_open()
             || self.panel_open()
             || self.x.view.get() != View::Root
-            || self.calc_hist_mode.get()
-            || self.history_mode.get()
-            || self.current_dir.borrow().is_some();
+            || !nav.is_root();
         LayoutCtx {
             mode_all: self.category.get() == Category::All,
             query_empty: empty,
-            query_typed: self.query_typed.get(),
+            query_typed: nav.typed,
             at_root: !sub_state && empty,
-            home_opened: self.home_opened.get(),
-            history_opened: self.history_opened.get(),
+            home_opened: nav.opened == Opened::Home,
+            history_opened: nav.opened == Opened::History,
             ..self.layout_ctx()
         }
     }
@@ -148,7 +147,7 @@ impl SpotlightWindow {
             return;
         }
         let Some(rd) = self.result_view.selected_row() else { return };
-        if self.history_mode.get() {
+        if self.in_recent() {
             return;
         }
         *self.panel.all.borrow_mut() = self.actions_for(&rd);
