@@ -1,24 +1,19 @@
 use crate::apps::{DesktopApp, load_apps};
 use crate::calculator::Calculator;
+use crate::category::Category;
 use crate::clipboard::ClipboardManager;
+use crate::core::debounce::{Debounce, RELOAD_DELAY_MS};
+use crate::ui::results::{result_row, RowData};
 use rusqlite::{Connection as SqliteConnection, OpenFlags};
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::process::Command;
 use std::rc::Rc;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::OnceLock;
 use std::thread;
 use zbus::blocking::Connection as ZbusConnection;
 
 pub const DEFAULT_LIMIT: usize = 500;
-
-#[derive(Clone, Debug)]
-pub struct SearchResult {
-    pub url: String,
-    pub title: String,
-    pub mime: String,
-    pub snippet: String,
-    pub app: Option<DesktopApp>,
-}
 
 #[derive(Clone)]
 pub struct SearchBackend {
@@ -58,6 +53,7 @@ impl SearchBackend {
 
         let dirs = crate::apps::get_desktop_dirs();
         let mut monitors_borrow = self.monitors.borrow_mut();
+        let debounce = Rc::new(RefCell::new(Debounce::default()));
 
         for dir in dirs {
             if dir.is_dir() {
@@ -65,12 +61,30 @@ impl SearchBackend {
                 if let Ok(monitor) = gfile.monitor_directory(gio::FileMonitorFlags::NONE, None::<&gio::Cancellable>) {
                     let apps_c = self.apps.clone();
                     let cb_c = self.on_apps_updated.clone();
+                    let debounce_c = debounce.clone();
                     monitor.connect_changed(move |_, _, _, event_type| {
                         if event_type == gio::FileMonitorEvent::Changed || event_type == gio::FileMonitorEvent::Created || event_type == gio::FileMonitorEvent::Deleted {
-                            *apps_c.borrow_mut() = load_apps();
-                            if let Some(cb) = &*cb_c.borrow() {
-                                cb();
+                            if !debounce_c.borrow_mut().trigger() {
+                                return;
                             }
+                            let apps_c = apps_c.clone();
+                            let cb_c = cb_c.clone();
+                            let debounce_c = debounce_c.clone();
+                            gtk4::glib::timeout_add_local_once(
+                                std::time::Duration::from_millis(RELOAD_DELAY_MS),
+                                move || {
+                                    debounce_c.borrow_mut().fire();
+                                    gtk4::glib::spawn_future_local(async move {
+                                        // load_apps() parses files: keep it off the GTK main thread.
+                                        if let Ok(apps) = gio::spawn_blocking(load_apps).await {
+                                            *apps_c.borrow_mut() = apps;
+                                            if let Some(cb) = &*cb_c.borrow() {
+                                                cb();
+                                            }
+                                        }
+                                    });
+                                },
+                            );
                         }
                     });
                     monitors_borrow.push(monitor);
@@ -87,46 +101,41 @@ impl SearchBackend {
         self.apps.borrow().clone()
     }
 
-    #[allow(dead_code)]
-    pub fn get_indexing_status(&self) -> (bool, String, f64) {
-        get_indexing_status_plain()
-    }
-
-    pub fn search_instant(&self, query: &str, category: &str, limit: usize) -> Vec<SearchResult> {
-        if category == "clipboard" {
+    pub fn search_instant(&self, query: &str, category: Category, limit: usize) -> Vec<RowData> {
+        if category == Category::Clipboard {
             if let Some(mgr) = &self.clipboard_mgr {
                 return mgr.search_history(query);
             }
             return Vec::new();
         }
 
-        if category == "web" {
+        if category == Category::Web {
             return self.search_web(query);
         }
 
         let q_clean = query.trim();
 
-        if category == "apps" || category == "applications" {
+        if category == Category::Applications {
             return self.search_apps(q_clean, limit);
         }
 
-        if q_clean.is_empty() && category == "all" {
+        if q_clean.is_empty() && category == Category::All {
             return self.search_apps("", limit.max(200));
         }
 
-        if category == "all" {
+        if category == Category::All {
             let mut results = Vec::new();
 
             // 1. Calculator
             let calc_eval = Calculator::evaluate(q_clean);
             if let Some((val_str, snippet)) = &calc_eval {
-                results.push(SearchResult {
-                    url: format!("calc://{}", val_str),
-                    title: val_str.clone(),
-                    mime: "application/x-calculator".to_string(),
-                    snippet: snippet.clone(),
-                    app: None,
-                });
+                results.push(result_row(
+                    format!("calc://{}", val_str),
+                    val_str.clone(),
+                    "application/x-calculator".to_string(),
+                    snippet.clone(),
+                    None,
+                ));
             }
 
             // 2. Clipboard (top 3)
@@ -154,13 +163,13 @@ impl SearchBackend {
 
     pub fn search_browser_history_async<F>(&self, query: &str, limit: usize, callback: F)
     where
-        F: Fn(Vec<SearchResult>) + 'static,
+        F: Fn(Vec<RowData>) + 'static,
     {
         let query = query.to_string();
-        run_async(move || query_browser_history_plain(&query, limit), callback);
+        run_async(JobKind::History, move |ctx| query_browser_history(ctx, &query, limit), callback);
     }
 
-    pub fn search_web(&self, query: &str) -> Vec<SearchResult> {
+    pub fn search_web(&self, query: &str) -> Vec<RowData> {
         // Instant web result (Google new-tab link). Browser-history lookup is
         // intentionally NOT done here: it opens SQLite on the UI thread and can
         // block on a locked places.sqlite. It runs asynchronously via
@@ -170,48 +179,28 @@ impl SearchBackend {
 
         if !q_strip.is_empty() {
             let encoded = urlencoding::encode(q_strip);
-            results.push(SearchResult {
-                url: format!("https://www.google.com/search?q={}", encoded),
-                title: format!("Search '{}' on the Web", q_strip),
-                mime: "text/html".to_string(),
-                snippet: format!("Open Google search for '{}'", q_strip),
-                app: None,
-            });
+            results.push(result_row(
+                format!("https://www.google.com/search?q={}", encoded),
+                format!("Search '{}' on the Web", q_strip),
+                "text/html".to_string(),
+                format!("Open Google search for '{}'", q_strip),
+                None,
+            ));
         } else {
-            results.push(SearchResult {
-                url: "https://www.google.com".to_string(),
-                title: "Google".to_string(),
-                mime: "text/html".to_string(),
-                snippet: "https://www.google.com".to_string(),
-                app: None,
-            });
-            results.push(SearchResult {
-                url: "https://github.com".to_string(),
-                title: "GitHub".to_string(),
-                mime: "text/html".to_string(),
-                snippet: "https://github.com".to_string(),
-                app: None,
-            });
-            results.push(SearchResult {
-                url: "https://youtube.com".to_string(),
-                title: "YouTube".to_string(),
-                mime: "text/html".to_string(),
-                snippet: "https://youtube.com".to_string(),
-                app: None,
-            });
-            results.push(SearchResult {
-                url: "https://wikipedia.org".to_string(),
-                title: "Wikipedia".to_string(),
-                mime: "text/html".to_string(),
-                snippet: "https://wikipedia.org".to_string(),
-                app: None,
-            });
+            for (url, title) in [
+                ("https://www.google.com", "Google"),
+                ("https://github.com", "GitHub"),
+                ("https://youtube.com", "YouTube"),
+                ("https://wikipedia.org", "Wikipedia"),
+            ] {
+                results.push(result_row(url.to_string(), title.to_string(), "text/html".to_string(), url.to_string(), None));
+            }
         }
 
         results
     }
 
-    pub fn search_apps(&self, query: &str, limit: usize) -> Vec<SearchResult> {
+    pub fn search_apps(&self, query: &str, limit: usize) -> Vec<RowData> {
         let q_lower = query.to_lowercase();
         let apps = self.apps.borrow();
         let mut results = Vec::new();
@@ -223,17 +212,13 @@ impl SearchBackend {
                 || app.lower_keywords.contains(&q_lower)
                 || app.filename.to_lowercase().contains(&q_lower)
             {
-                results.push(SearchResult {
-                    url: format!("app://{}", app.filename),
-                    title: app.name.clone(),
-                    mime: "application/x-desktop".to_string(),
-                    snippet: if !app.comment.is_empty() {
-                        app.comment.clone()
-                    } else {
-                        app.filename.clone()
-                    },
-                    app: Some(app.clone()),
-                });
+                results.push(result_row(
+                    format!("app://{}", app.filename),
+                    app.name.clone(),
+                    "application/x-desktop".to_string(),
+                    if !app.comment.is_empty() { app.comment.clone() } else { app.filename.clone() },
+                    Some(app.clone()),
+                ));
 
                 if results.len() >= limit {
                     break;
@@ -244,22 +229,11 @@ impl SearchBackend {
         results
     }
 
-    #[allow(dead_code)]
-    pub fn search_sync(&self, query: &str, category: &str, limit: usize) -> Vec<SearchResult> {
-        let mut results = self.search_instant(query, category, limit);
-        if category == "apps" || category == "applications" || category == "clipboard" || category == "web" {
-            return results;
-        }
-
-        results.extend(search_nautilus(query, category, limit));
-        results
-    }
-
-    pub fn search_async<F>(&self, query: &str, category: &str, limit: usize, callback: F)
+    pub fn search_async<F>(&self, query: &str, category: Category, limit: usize, callback: F)
     where
-        F: Fn(Vec<SearchResult>) + 'static,
+        F: Fn(Vec<RowData>) + 'static,
     {
-        if category == "apps" || category == "applications" || category == "clipboard" || category == "web" {
+        if matches!(category, Category::Applications | Category::Clipboard | Category::Web) {
             gtk4::glib::idle_add_local(move || {
                 callback(Vec::new());
                 gtk4::glib::ControlFlow::Break
@@ -268,30 +242,85 @@ impl SearchBackend {
         }
 
         let query = query.to_string();
-        let category = category.to_string();
-        run_async(move || search_nautilus(&query, &category, limit), callback);
-    }
-
-    #[allow(dead_code)]
-    fn execute_sparql(&self, sparql: &str) -> Vec<SearchResult> {
-        execute_sparql_external(sparql)
+        run_async(JobKind::Files, move |ctx| search_nautilus(ctx, &query, category, limit), callback);
     }
 }
 
 thread_local! {
     /// Callbacks waiting for a worker result, keyed by job id. Touched only on the GTK main thread.
-    static PENDING: RefCell<std::collections::HashMap<u64, Box<dyn FnOnce(Vec<SearchResult>)>>> =
+    static PENDING: RefCell<std::collections::HashMap<u64, Box<dyn FnOnce(Vec<RowData>)>>> =
         RefCell::new(std::collections::HashMap::new());
     static NEXT_JOB: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Runs `job` on a worker thread and calls `callback` with its result on the calling (main)
-/// thread. The worker wakes the main loop with `MainContext::invoke` when it finishes, so no
-/// polling timer exists while a search is pending. `callback` is always called exactly once.
-fn run_async<J, F>(job: J, callback: F)
+/// Which stream a job belongs to. Only the newest queued job of each kind is worth running.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum JobKind {
+    Files,
+    History,
+}
+
+/// State owned by the single worker thread, reused across jobs.
+#[derive(Default)]
+struct WorkerCtx {
+    session: Option<ZbusConnection>,
+    /// Read-only handles to each `places.sqlite`, opened on first use.
+    history_dbs: std::collections::HashMap<PathBuf, SqliteConnection>,
+}
+
+impl WorkerCtx {
+    /// The session bus connection: created once, kept until a call on it fails.
+    fn session(&mut self) -> Option<&ZbusConnection> {
+        if self.session.is_none() {
+            self.session = ZbusConnection::session().ok();
+        }
+        self.session.as_ref()
+    }
+}
+
+struct Job {
+    id: u64,
+    kind: JobKind,
+    run: Box<dyn FnOnce(&mut WorkerCtx) -> Vec<RowData> + Send>,
+}
+
+/// For queued jobs in arrival order, flags the ones to run: the last of each kind.
+fn newest_per_kind(kinds: &[JobKind]) -> Vec<bool> {
+    (0..kinds.len()).map(|i| !kinds[i + 1..].contains(&kinds[i])).collect()
+}
+
+fn worker_loop(rx: Receiver<Job>, main: gtk4::glib::MainContext) {
+    let mut state = WorkerCtx::default();
+    while let Ok(first) = rx.recv() {
+        let mut batch = vec![first];
+        while let Ok(job) = rx.try_recv() {
+            batch.push(job);
+        }
+        let kinds: Vec<JobKind> = batch.iter().map(|j| j.kind).collect();
+        for (job, keep) in batch.into_iter().zip(newest_per_kind(&kinds)) {
+            // A superseded job still answers (empty) so the caller's callback runs exactly once.
+            let results = if keep { (job.run)(&mut state) } else { Vec::new() };
+            let id = job.id;
+            main.invoke(move || {
+                if let Some(cb) = PENDING.with(|p| p.borrow_mut().remove(&id)) {
+                    cb(results);
+                }
+            });
+        }
+    }
+}
+
+static WORKER: OnceLock<Sender<Job>> = OnceLock::new();
+
+/// Queues `job` on the single search worker and calls `callback` with its result on the calling
+/// (main) thread. The worker wakes the main loop with `MainContext::invoke` when it finishes, so
+/// no polling timer exists while a search is pending. A queued job superseded by a newer one of
+/// the same kind is skipped and answered with an empty result. `callback` is always called
+/// exactly once.
+fn run_async<J, F>(kind: JobKind, job: J, callback: F)
 where
-    J: FnOnce() -> Vec<SearchResult> + Send + 'static,
-    F: FnOnce(Vec<SearchResult>) + 'static,
+    J: FnOnce(&mut WorkerCtx) -> Vec<RowData> + Send + 'static,
+    F: FnOnce(Vec<RowData>) + 'static,
 {
     let id = NEXT_JOB.with(|n| {
         let id = n.get();
@@ -299,42 +328,40 @@ where
         id
     });
     PENDING.with(|p| p.borrow_mut().insert(id, Box::new(callback)));
-    let ctx = gtk4::glib::MainContext::default();
-    thread::spawn(move || {
-        let results = job();
-        ctx.invoke(move || {
-            if let Some(cb) = PENDING.with(|p| p.borrow_mut().remove(&id)) {
-                cb(results);
-            }
-        });
+    let tx = WORKER.get_or_init(|| {
+        let (tx, rx) = channel();
+        let main = gtk4::glib::MainContext::default();
+        thread::spawn(move || worker_loop(rx, main));
+        tx
     });
+    let _ = tx.send(Job { id, kind, run: Box::new(job) });
 }
 
-pub fn matches_category(filename: &str, category: &str) -> bool {
-    if category.is_empty() || category == "all" || category == "files" {
+pub fn matches_category(filename: &str, category: Category) -> bool {
+    if matches!(category, Category::All | Category::Files) {
         return true;
     }
     let lower = filename.to_lowercase();
     let ext = lower.split('.').last().unwrap_or("");
     match category {
-        "documents" => matches!(
+        Category::Documents => matches!(
             ext,
             "pdf" | "txt" | "md" | "doc" | "docx" | "odt" | "xls" | "xlsx" | "ods"
                 | "ppt" | "pptx" | "odp" | "csv" | "rtf" | "epub" | "html" | "json"
                 | "xml" | "yaml" | "yml" | "sh" | "py" | "c" | "cpp" | "h" | "rs"
                 | "go" | "js" | "ts" | "toml" | "log" | "tex"
         ),
-        "images" => matches!(
+        Category::Images => matches!(
             ext,
             "png" | "jpg" | "jpeg" | "svg" | "webp" | "gif" | "avif" | "ico"
                 | "bmp" | "tiff" | "heic" | "psd" | "raw"
         ),
-        "audio" => matches!(
+        Category::Audio => matches!(
             ext,
             "mp3" | "flac" | "wav" | "ogg" | "m4a" | "aac" | "opus" | "wma"
                 | "oga" | "mid" | "midi"
         ),
-        "video" => matches!(
+        Category::Video => matches!(
             ext,
             "mp4" | "mkv" | "avi" | "mov" | "webm" | "flv" | "wmv" | "m4v"
                 | "3gp" | "ts" | "mpg" | "mpeg"
@@ -343,7 +370,7 @@ pub fn matches_category(filename: &str, category: &str) -> bool {
     }
 }
 
-pub fn search_nautilus(query: &str, category: &str, limit: usize) -> Vec<SearchResult> {
+fn search_nautilus(ctx: &mut WorkerCtx, query: &str, category: Category, limit: usize) -> Vec<RowData> {
     let mut results = Vec::new();
     let q_trimmed = query.trim();
     if q_trimmed.is_empty() {
@@ -357,14 +384,23 @@ pub fn search_nautilus(query: &str, category: &str, limit: usize) -> Vec<SearchR
 
     // Call Nautilus SearchProvider over D-Bus
     let nautilus_uris = (|| -> Option<Vec<String>> {
-        let conn = ZbusConnection::session().ok()?;
+        let conn = ctx.session()?;
         let reply = conn.call_method(
             Some("org.gnome.Nautilus"),
             "/org/gnome/Nautilus/SearchProvider",
             Some("org.gnome.Shell.SearchProvider2"),
             "GetInitialResultSet",
             &(terms,),
-        ).ok()?;
+        );
+        let reply = match reply {
+            Ok(r) => r,
+            Err(zbus::Error::MethodError(..)) => return None,
+            Err(_) => {
+                // Transport failure: drop the connection so the next job reconnects.
+                ctx.session = None;
+                return None;
+            }
+        };
         let (uris,): (Vec<String>,) = reply.body().deserialize().ok()?;
         Some(uris)
     })();
@@ -408,27 +444,43 @@ pub fn search_nautilus(query: &str, category: &str, limit: usize) -> Vec<SearchR
             clean_url.to_string()
         };
 
-        results.push(SearchResult {
-            url,
-            title,
-            mime,
-            snippet: path_display,
-            app: None,
-        });
+        results.push(result_row(url, title, mime, path_display, None));
 
         if results.len() >= limit {
             break;
         }
     }
 
-    results.sort_unstable_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    order_file_results(&mut results, q_trimmed);
     results
+}
+
+/// Stable sort by title relevance: exact name, prefix, whole word, substring, rest.
+/// Equal relevance keeps input order (Nautilus rank, or fallback walk order).
+fn order_file_results(results: &mut [RowData], query: &str) {
+    let q = query.to_lowercase();
+    let tier = |title: &str| -> u8 {
+        let t = title.to_lowercase();
+        let stem = t.rsplit_once('.').map_or(t.as_str(), |(s, _)| s);
+        if t == q || stem == q {
+            0
+        } else if t.starts_with(&q) {
+            1
+        } else if t.split(|c: char| !c.is_alphanumeric()).any(|w| w == q) {
+            2
+        } else if t.contains(&q) {
+            3
+        } else {
+            4
+        }
+    };
+    results.sort_by_cached_key(|r| tier(&r.row.title));
 }
 
 fn fallback_file_search(query: &str, limit: usize) -> Vec<String> {
     let q_lower = query.to_lowercase();
     let mut results = Vec::new();
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/home/jaime"));
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let search_roots = [
         dirs::document_dir().unwrap_or_else(|| home.join("Documents")),
         dirs::download_dir().unwrap_or_else(|| home.join("Downloads")),
@@ -473,70 +525,14 @@ fn walk_shallow(dir: &std::path::Path, query: &str, results: &mut Vec<String>, l
     }
 }
 
-fn execute_sparql_external(sparql: &str) -> Vec<SearchResult> {
-    let mut results = Vec::new();
-
-    let output = Command::new("tinysparql")
-        .args(&["query", "-b", "org.freedesktop.LocalSearch3", "-q", sparql])
-        .output()
-        .or_else(|_| {
-            Command::new("tracker3")
-                .args(&["sparql", "-q", sparql])
-                .output()
-        });
-
-    if let Ok(output) = output {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with("Resultados:") || trimmed.starts_with("Results:") {
-                continue;
-            }
-
-            if trimmed.starts_with("file://") || trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-                let url = trimmed.to_string();
-                if seen.contains(&url) {
-                    continue;
-                }
-                seen.insert(url.clone());
-                let clean_url = url.trim_end_matches('/');
-                let filename_part = clean_url.split('/').last().unwrap_or(clean_url);
-                let title = match urlencoding::decode(filename_part) {
-                    Ok(decoded) if !decoded.trim().is_empty() => decoded.into_owned(),
-                    _ => filename_part.to_string(),
-                };
-
-                let mime = mime_guess::from_path(&title)
-                    .first_raw()
-                    .unwrap_or("application/octet-stream")
-                    .to_string();
-
-                results.push(SearchResult {
-                    url,
-                    title,
-                    mime,
-                    snippet: String::new(),
-                    app: None,
-                });
-            }
-        }
-    }
-
-    results.sort_unstable_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-    results
+#[cfg(test)]
+fn query_browser_history_plain(query: &str, limit: usize) -> Vec<RowData> {
+    query_browser_history(&mut WorkerCtx::default(), query, limit)
 }
 
-pub fn get_indexing_status_plain() -> (bool, String, f64) {
-    // Localsearch / Tracker daemon is disabled in Pulsar OS to save CPU/battery.
-    // Nautilus search engine handles file queries without background indexing.
-    (false, "Idle".to_string(), 1.0)
-}
-
-fn query_browser_history_plain(query: &str, limit: usize) -> Vec<SearchResult> {
+fn query_browser_history(ctx: &mut WorkerCtx, query: &str, limit: usize) -> Vec<RowData> {
     let mut results = Vec::new();
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/home/jaime"));
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
 
     let mut paths = Vec::new();
     paths.push(home.join(".mozilla/seafari-profile/places.sqlite"));
@@ -557,13 +553,18 @@ fn query_browser_history_plain(query: &str, limit: usize) -> Vec<SearchResult> {
             continue;
         }
 
-        if let Ok(conn) = SqliteConnection::open_with_flags(
-            &db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        ) {
-            // The browser holds an exclusive lock while running; never
-            // let the UI block waiting for it
-            let _ = conn.busy_timeout(std::time::Duration::from_millis(100));
+        if !ctx.history_dbs.contains_key(&db_path) {
+            if let Ok(conn) = SqliteConnection::open_with_flags(
+                &db_path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            ) {
+                // The browser holds an exclusive lock while running; never
+                // let the worker block waiting for it
+                let _ = conn.busy_timeout(std::time::Duration::from_millis(100));
+                ctx.history_dbs.insert(db_path.clone(), conn);
+            }
+        }
+        if let Some(conn) = ctx.history_dbs.get(&db_path) {
             let sql = if query.is_empty() {
                 format!("SELECT url, title FROM moz_places WHERE hidden = 0 AND title != '' ORDER BY frecency DESC LIMIT {}", limit)
             } else {
@@ -593,13 +594,7 @@ fn query_browser_history_plain(query: &str, limit: usize) -> Vec<SearchResult> {
 
                 for (url, title) in rows {
                     let title = title.unwrap_or_else(|| url.clone());
-                    results.push(SearchResult {
-                        title,
-                        snippet: url.clone(),
-                        url,
-                        mime: "text/html".to_string(),
-                        app: None,
-                    });
+                    results.push(result_row(url.clone(), title, "text/html".to_string(), url, None));
                 }
             }
         }
