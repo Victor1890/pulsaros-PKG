@@ -5,6 +5,7 @@ use crate::clipboard::ClipboardManager;
 use crate::config::SpotlightConfig;
 use crate::core::commands::{self, Command};
 use crate::core::frecency::Frecency;
+use crate::core::nav::{Browse, Nav, NavEvent, Opened};
 use crate::core::layout::{self, Action as LayoutAction, BarMode, Context as LayoutCtx, Event as LayoutEvent, LayoutState};
 use crate::core::root_search::{AppEntry, Ctx, Row, RowKind, RootSearch, SearchIndex};
 use crate::core::settings::Settings;
@@ -53,11 +54,10 @@ pub struct SpotlightWindow {
     config: Rc<RefCell<SpotlightConfig>>,
     backend: SearchBackend,
     category: Cell<Category>,
-    current_dir: Rc<RefCell<Option<String>>>,
+    /// Which list is shown, how the Panel opened, whether the query was typed.
+    nav: RefCell<Nav>,
     debounce_id: Rc<RefCell<Option<glib::SourceId>>>,
     search_seq: Rc<Cell<u64>>,
-    history_mode: Cell<bool>,
-    calc_hist_mode: Cell<bool>,
     calc_history: RefCell<CalcHistory>,
     last_currency: Cell<Option<std::time::Instant>>,
 
@@ -100,12 +100,6 @@ pub struct SpotlightWindow {
     hypr_poll: RefCell<Option<glib::SourceId>>,
     /// The buttons were shown at some point since the window opened.
     revealed: Cell<bool>,
-    /// The query text came from the user's typing (not from a mode or a view).
-    query_typed: Cell<bool>,
-    /// The Panel was opened by Down (home view).
-    home_opened: Cell<bool>,
-    /// The Panel was opened by Up (history).
-    history_opened: Cell<bool>,
     /// First pointer position seen since the window opened.
     pointer_origin: Cell<Option<(f64, f64)>>,
     /// Everything below the header row; hidden while the layout is Idle.
@@ -448,11 +442,9 @@ impl SpotlightWindow {
             config: config_rc,
             backend,
             category: Cell::new(Category::All),
-            current_dir: Rc::new(RefCell::new(None)),
+            nav: RefCell::new(Nav::default()),
             debounce_id: Rc::new(RefCell::new(None)),
             search_seq: Rc::new(Cell::new(0)),
-            history_mode: Cell::new(false),
-            calc_hist_mode: Cell::new(false),
             calc_history: RefCell::new(CalcHistory::open()),
             last_currency: Cell::new(None),
             store,
@@ -499,9 +491,6 @@ impl SpotlightWindow {
             global_pointer: Cell::new(false),
             hypr_poll: RefCell::new(None),
             revealed: Cell::new(false),
-            query_typed: Cell::new(false),
-            home_opened: Cell::new(false),
-            history_opened: Cell::new(false),
             pointer_origin: Cell::new(None),
             panel_parts,
             progress_revealer,
@@ -638,13 +627,23 @@ impl SpotlightWindow {
         self.refresh_extras();
     }
 
+    fn nav_apply(&self, e: NavEvent) {
+        self.nav.borrow_mut().apply(e);
+    }
+
+    fn in_recent(&self) -> bool {
+        self.nav.borrow().browse == Browse::RecentSearches
+    }
+
+    fn in_calc_history(&self) -> bool {
+        self.nav.borrow().browse == Browse::CalcHistory
+    }
+
     fn reset_to_root(self: &Rc<Self>) {
         self.close_panel();
         self.close_dialog();
         self.leave_view();
-        *self.current_dir.borrow_mut() = None;
-        self.history_mode.set(false);
-        self.calc_hist_mode.set(false);
+        self.nav_apply(NavEvent::ToRoot);
         self.category.set(Category::All);
         self.apply_layout(if self.revealed.get() { LayoutState::IdleModes } else { LayoutState::Idle });
         self.set_mode(Category::All);
@@ -660,9 +659,7 @@ impl SpotlightWindow {
             self.revealed.set(true);
         }
         if idle {
-            self.home_opened.set(false);
-            self.history_opened.set(false);
-            self.query_typed.set(false);
+            self.nav_apply(NavEvent::Collapsed);
         }
         for w in &self.panel_parts {
             w.set_visible(!idle);
@@ -849,13 +846,13 @@ impl SpotlightWindow {
     }
 
     fn on_search_changed(self: &Rc<Self>) {
-        self.history_mode.set(false);
+        self.nav_apply(NavEvent::QueryChanged);
         let empty = self.search_entry.text().is_empty();
         if self.layout.get() != LayoutState::Panel && !empty {
             self.apply_layout(LayoutState::Panel);
         }
         if empty {
-            let typed = self.query_typed.replace(false);
+            let typed = std::mem::replace(&mut self.nav.borrow_mut().typed, false);
             let ctx = LayoutCtx { query_typed: typed, ..self.panel_ctx() };
             let o = layout::transition(self.layout.get(), &ctx, LayoutEvent::QueryEmptied);
             if o.action == LayoutAction::Collapse {
@@ -863,7 +860,7 @@ impl SpotlightWindow {
                 return;
             }
         } else {
-            self.query_typed.set(true);
+            self.nav_apply(NavEvent::Typed(true));
         }
         if let Some(id) = self.debounce_id.borrow_mut().take() {
             id.remove();
@@ -951,15 +948,15 @@ impl SpotlightWindow {
         }
 
         // If in media/document category and query empty and not browsing, start browsing the category dir
-        if query.trim().is_empty() && self.current_dir.borrow().is_none() {
+        if query.trim().is_empty() && self.nav.borrow().is_root() {
             if let Some(d) = category.browse_dir() {
                 if d.is_dir() {
-                    *self.current_dir.borrow_mut() = Some(d.display().to_string());
+                    self.nav_apply(NavEvent::OpenDir(d.display().to_string()));
                 }
             }
         }
 
-        let browsing_dir = self.current_dir.borrow().clone();
+        let browsing_dir = self.nav.borrow().dir().map(str::to_string);
         if let Some(dir_path) = browsing_dir.as_ref() {
             let rows = browse_directory_plain(dir_path, query.trim());
             *self.current.borrow_mut() = vec![("Files".to_string(), rows)];
@@ -968,7 +965,7 @@ impl SpotlightWindow {
         }
 
         let is_empty = query.trim().is_empty();
-        if self.calc_hist_mode.get() {
+        if self.in_calc_history() {
             let rows: Vec<RowData> = self
                 .calc_history
                 .borrow()
@@ -1113,15 +1110,14 @@ impl SpotlightWindow {
         if rows.is_empty() {
             return;
         }
-        self.history_mode.set(true);
+        self.nav_apply(NavEvent::ShowRecent);
         *self.current.borrow_mut() = vec![("Recent searches".to_string(), rows)];
         self.render(false);
     }
 
     fn enter_calc_history(self: &Rc<Self>) {
         self.close_panel();
-        self.calc_hist_mode.set(true);
-        self.history_mode.set(false);
+        self.nav_apply(NavEvent::ShowCalcHistory);
         self.search_entry.set_placeholder_text(Some("Search calculator history\u{2026}"));
         self.search_entry.set_text("");
         self.do_search(false);
@@ -1138,7 +1134,7 @@ impl SpotlightWindow {
 
     /// Switch mode: updates category, glyph and placeholder (no search).
     fn set_mode(&self, cat: Category) {
-        self.query_typed.set(false);
+        self.nav_apply(NavEvent::Typed(false));
         self.category.set(cat);
         set_mode_icon(&self.mode_icon, cat.glyph());
         self.search_entry.set_placeholder_text(Some(cat.placeholder()));
@@ -1165,9 +1161,7 @@ impl SpotlightWindow {
     fn goto_mode(self: &Rc<Self>, cat: Category) {
         self.leave_view();
         self.set_mode(cat);
-        *self.current_dir.borrow_mut() = None;
-        self.history_mode.set(false);
-        self.calc_hist_mode.set(false);
+        self.nav_apply(NavEvent::ToRoot);
         match cat {
             Category::Windows => {
                 self.push_view(View::Windows, "Filter open windows\u{2026}");
@@ -1252,7 +1246,7 @@ impl SpotlightWindow {
     }
 
     fn run_action_index(self: &Rc<Self>, n: usize) {
-        if self.history_mode.get() {
+        if self.in_recent() {
             if let Some(rd) = self.result_view.selected_row() {
                 self.perform(rd, "open", None);
             }
@@ -1276,7 +1270,7 @@ impl SpotlightWindow {
         match action {
             "calc_copy" | "calc_paste" | "calc_full" => {
                 let Some(c) = rd.calc.clone() else { return };
-                if !self.calc_hist_mode.get() {
+                if !self.in_calc_history() {
                     self.calc_history.borrow_mut().add(&c);
                 }
                 match action {
@@ -1319,7 +1313,7 @@ impl SpotlightWindow {
             }
             "open" | "run" | "open_url" => {
                 if let Some(q) = id.strip_prefix("history:") {
-                    self.history_mode.set(false);
+                    self.nav_apply(NavEvent::QueryChanged);
                     self.search_entry.set_text(q);
                     self.search_entry.set_position(-1);
                     return;
@@ -1516,7 +1510,7 @@ impl SpotlightWindow {
         }
         let clean_path = res.url.trim_start_matches("file://");
         if Path::new(clean_path).is_dir() && (res.mime == "inode/directory" || res.mime == "folder") {
-            *self.current_dir.borrow_mut() = Some(clean_path.to_string());
+            self.nav_apply(NavEvent::OpenDir(clean_path.to_string()));
             self.search_entry.set_text("");
             self.search_entry.set_placeholder_text(Some(&format!("Browsing: {}", clean_path)));
             // set_text only emits 'changed' when the text differs
@@ -1582,23 +1576,23 @@ impl SpotlightWindow {
             return;
         }
         // Clearing the query here is a step back, not a typed deletion.
-        self.query_typed.set(false);
+        self.nav_apply(NavEvent::Typed(false));
         if self.dialog_open() {
             self.close_dialog();
         } else if self.panel_open() {
             self.close_panel();
         } else if self.x.view.get() != View::Root {
             self.pop_view();
-        } else if self.calc_hist_mode.get() {
-            self.calc_hist_mode.set(false);
+        } else if self.in_calc_history() {
+            self.nav_apply(NavEvent::Back);
             self.search_entry.set_placeholder_text(Some(self.mode_name()));
             self.search_entry.set_text("");
             self.do_search(false);
-        } else if self.history_mode.get() {
-            self.history_mode.set(false);
+        } else if self.in_recent() {
+            self.nav_apply(NavEvent::Back);
             self.do_search(false);
-        } else if self.current_dir.borrow().is_some() {
-            *self.current_dir.borrow_mut() = None;
+        } else if self.nav.borrow().dir().is_some() {
+            self.nav_apply(NavEvent::Back);
             self.search_entry.set_text("");
             self.search_entry.set_placeholder_text(Some(self.mode_name()));
             self.do_search(false);
@@ -1670,9 +1664,7 @@ impl SpotlightWindow {
         if keyval == gdk::Key::Up && !mods.ctrl && !mods.alt && !mods.shift {
             if !self.result_view.step(-1)
                 && self.search_entry.text().is_empty()
-                && !self.history_mode.get()
-                && !self.calc_hist_mode.get()
-                && self.current_dir.borrow().is_none()
+                && self.nav.borrow().is_root()
             {
                 self.show_history();
             }
@@ -1695,15 +1687,11 @@ impl SpotlightWindow {
 
         // Backspace on empty: ascend directory
         if keyval == gdk::Key::BackSpace && self.search_entry.text().is_empty() {
-            let parent = self
-                .current_dir
-                .borrow()
-                .as_ref()
-                .and_then(|d| Path::new(d).parent().map(|p| (p.display().to_string(), d.clone())))
-                .filter(|(p, d)| p != d);
-            if let Some((parent, _)) = parent {
+            let before = self.nav.borrow().dir().map(str::to_string);
+            self.nav_apply(NavEvent::ParentDir);
+            let after = self.nav.borrow().dir().map(str::to_string);
+            if let Some(parent) = after.filter(|p| Some(p) != before.as_ref()) {
                 self.search_entry.set_placeholder_text(Some(&format!("Browsing: {}", parent)));
-                *self.current_dir.borrow_mut() = Some(parent);
                 self.do_search(false);
                 return glib::Propagation::Stop;
             }
@@ -1775,12 +1763,12 @@ impl SpotlightWindow {
         match layout::transition(self.layout.get(), &self.layout_ctx(), event).action {
             LayoutAction::ShowHome => {
                 self.apply_layout(LayoutState::Panel);
-                self.home_opened.set(true);
+                self.nav_apply(NavEvent::PanelOpened(Opened::Home));
                 self.do_search(false);
             }
             LayoutAction::ShowHistory => {
                 self.apply_layout(LayoutState::Panel);
-                self.history_opened.set(true);
+                self.nav_apply(NavEvent::PanelOpened(Opened::History));
                 if self.settings.borrow().history().is_empty() {
                     self.do_search(false);
                 } else {
@@ -1814,9 +1802,7 @@ impl SpotlightWindow {
             Act::Up => {
                 if !self.result_view.step(-1)
                     && self.search_entry.text().is_empty()
-                    && !self.history_mode.get()
-                    && !self.calc_hist_mode.get()
-                    && self.current_dir.borrow().is_none()
+                    && self.nav.borrow().is_root()
                 {
                     self.show_history();
                 }
