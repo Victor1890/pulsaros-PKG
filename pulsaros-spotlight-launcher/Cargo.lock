@@ -1064,6 +1064,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "spotlight-core",
  "urlencoding",
  "zbus",
 ]
@@ -1290,6 +1291,21 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+
+[[package]]
+name = "spotlight-core"
+version = "2.0.43"
+dependencies = [
+ "dirs",
+ "libc",
+ "mime_guess",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "urlencoding",
+ "zbus",
+]
 
 [[package]]
 name = "static_assertions"
